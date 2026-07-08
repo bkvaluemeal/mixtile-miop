@@ -1,0 +1,12 @@
+[Unit]
+Description=Load MIOP kernel modules
+After=sysinit.target
+Before=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/miop-driver-loader.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
