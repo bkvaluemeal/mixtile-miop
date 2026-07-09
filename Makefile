@@ -2,34 +2,27 @@ obj-m += miop-reg.o
 obj-m += miop-ep.o
 obj-m += miop-ep-net.o
 obj-m += pcie-ep-rk35.o
-miop-reg-objs := reg.o meta_reg.o
-miop-ep-objs := ep.o meta_ep.o
-miop-ep-net-objs := net.o meta_net.o
-pcie-ep-rk35-objs := pcie.o meta_pcie.o
 
-CFLAGS_meta_reg.o := -DEXPORT_REG_SYMBOLS
+miop-reg-objs := reg.o
+miop-ep-objs := ep.o
+miop-ep-net-objs := net.o
+pcie-ep-rk35-objs := pcie.o
+
+CFLAGS_reg.o := -DEXPORT_REG_SYMBOLS
+
+ccflags-y := -Wno-error
+OBJECT_FILES_NON_STANDARD := y
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
-OBJCOPY ?= objcopy
+OBJCOPY ?= aarch64-linux-gnu-objcopy
 
-PKG_NAME := miop-driver-service
-PKG_VER := $(shell uname -r)
-PKG_ARCH := arm64
-DEB_STAGING := deb_build/$(PKG_NAME)_$(PKG_VER)_$(PKG_ARCH)
-
-all: shared_c
+all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 	-$(OBJCOPY) --remove-section __kcrctab --remove-section __kcrctab_gpl miop-reg.ko 2>/dev/null || true
 	-$(OBJCOPY) --remove-section __kcrctab --remove-section __kcrctab_gpl miop-ep.ko 2>/dev/null || true
-	-$(OBJCOPY) --remove-section __kcrctab --remove-section __kcrctab_gpl miop-ep=net.ko 2>/dev/null || true
+	-$(OBJCOPY) --remove-section __kcrctab --remove-section __kcrctab_gpl miop-ep-net.ko 2>/dev/null || true
 	-$(OBJCOPY) --remove-section __kcrctab --remove-section __kcrctab_gpl pcie-ep-rk35.ko 2>/dev/null || true
-
-shared_c:
-	@ln -sf meta.c meta_ep.c
-	@ln -sf meta.c meta_reg.c
-	@ln -sf meta.c meta_net.c
-	@ln -sf meta.c meta_pcie.c
 
 install: all
 	install -d /lib/miop
@@ -67,4 +60,4 @@ deb: all
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	@rm -rf meta_ep.c meta_reg.c meta_net.c meta_pcie.c deb_build $(PKG_NAME)_$(PKG_VER)_$(PKG_ARCH).deb
+	@rm -rf deb_build $(PKG_NAME)_$(PKG_VER)_$(PKG_ARCH).deb
