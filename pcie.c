@@ -940,11 +940,15 @@ static int miop_pcie_ep_probe(struct device *dev)
 		for (i = 0; i < MIOP_DMA_NUM_CH; i++)
 			writel(0x10001 << i, pcie->dbi_base + 0x380058);
 
+		/* APB master interrupt gate — verify writable */
+		writel(0x80000000, pcie->apb_base + 0x24);
+		v = readl(pcie->apb_base + 0x24);
 		dev_info(pcie->dev,
 			 "DMA init: buf=%p dma=%pad ring_dma[0]=%llx "
 			 "dbi=0x%08x ch_st=0x%08x "
 			 "0x21C=0x%08x 0x200=0x%08x 0x0A8=0x%08x 0x0C4=0x%08x "
-			 "apb[0x10]=0x%08x apb[0x18]=0x%08x apb[0x24]=0x%08x\n",
+			 "apb=%p apb[0x10]=0x%08x apb[0x18]=0x%08x "
+			 "apb[0x24]=0x%08x wr24=0x%08x\n",
 			 pcie->dma_buf, &pcie->dma_dma,
 			 (u64)pcie->chan[0].ring_dma,
 			 readl(pcie->dbi_base + 0x38000C),
@@ -953,9 +957,11 @@ static int miop_pcie_ep_probe(struct device *dev)
 			 readl(pcie->dbi_base + 0x380200),
 			 readl(pcie->dbi_base + 0x3800A8),
 			 readl(pcie->dbi_base + 0x3800C4),
+			 pcie->apb_base,
 			 readl(pcie->apb_base + 0x10),
 			 readl(pcie->apb_base + 0x18),
-			 readl(pcie->apb_base + 0x24));
+			 readl(pcie->apb_base + 0x24),
+			 v);
 	}
 
 	dev_info(dev, "Mixtile RK35 EP probe: n_free=%u n_win=%u serial=%#x link=%s\n",

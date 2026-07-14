@@ -128,6 +128,7 @@ struct miop_pcie {
 	u32 serial;
 	int link_up;
 	struct task_struct *link_task;
+	struct timer_list reap_timer;
 	struct miop_pcie_channel chan[MIOP_DMA_NUM_CH];
 };
 
