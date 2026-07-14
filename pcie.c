@@ -833,20 +833,19 @@ static void miop_pcie_bar_check_work(struct work_struct *work)
 		 readl(pcie->dbi_base + 0x150),
 		 peer_low, peer_hi);
 
-	/* DMA self-test with the full factory batch-submit sequence */
+	/* DMA self-test using the interrupt-handler init sequence */
 	{
 		struct miop_dma_desc *d = pcie->chan[0].ring;
 		u64 dest_addr;
 		u32 r;
 		int tries = 0;
 
-		/* Only use peer_addr if it looks valid (< 64-bit PCIe space) */
 		if (peer_addr > 0x100000000ULL && peer_addr < 0x10000000000ULL)
 			dest_addr = peer_addr;
 		else
 			dest_addr = 0x900030000ULL;
 
-		dev_info(dev, "DMA self-test: dest=0x%llx ring_dma=0x%llx\n",
+		dev_info(dev, "DMA self-test: dest=0x%llx ring=0x%llx\n",
 			 dest_addr, (u64)pcie->chan[0].ring_dma);
 
 		memset(d, 0, sizeof(*d));
@@ -858,35 +857,49 @@ static void miop_pcie_bar_check_work(struct work_struct *work)
 		d->status = 1;
 		wmb();
 
-		/* Write producer index (=1) to ring trailer */
+		/* Producer index to trailer */
 		*(u32 *)((char *)d +
 			 MIOP_DMA_RING_SIZE * sizeof(struct miop_dma_desc)
 			 + 4) = 1;
 		wmb();
 
-		/* Full factory batch-submit sequence */
-		writel(1, pcie->dbi_base + 0x38000C);          /* engine trip */
-		writel(0x40000308, pcie->dbi_base + 0x380200); /* ch0 write ctrl */
-		writel(0,          pcie->dbi_base + 0x380204); /* ch0 write status */
-		writel(0x40000308, pcie->dbi_base + 0x380300); /* ch0 read ctrl */
-		writel(0,          pcie->dbi_base + 0x380304); /* ch0 read status */
+		/*** Interrupt-handler init sequence (pcie_asm.S:1360-1483) ***/
+		writel(1, pcie->dbi_base + 0x38000C);
 
+		r = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
+		writel(r & ~3u, pcie->dbi_base + 0x380054);
+
+		r = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380090);
+		writel(r | 0x30000, pcie->dbi_base + 0x380090);
+
+		writel(0x40000308, pcie->dbi_base + 0x380200);
+		writel(0,          pcie->dbi_base + 0x380204);
 		writel((u32)pcie->chan[0].ring_dma,
 		       pcie->dbi_base + 0x38021C);
 		writel((u32)(pcie->chan[0].ring_dma >> 32),
 		       pcie->dbi_base + 0x380220);
+
+		writel(0x40000308, pcie->dbi_base + 0x380400);
+		writel(0,          pcie->dbi_base + 0x380404);
+		writel((u32)pcie->chan[0].ring_dma,
+		       pcie->dbi_base + 0x38041C);
+		writel((u32)(pcie->chan[0].ring_dma >> 32),
+		       pcie->dbi_base + 0x380420);
+
+		writel(1, pcie->dbi_base + 0x38002C);
+
+		writel(0x40000308, pcie->dbi_base + 0x380300);
+		writel(0,          pcie->dbi_base + 0x380304);
 		writel((u32)pcie->chan[0].ring_dma,
 		       pcie->dbi_base + 0x38031C);
 		writel((u32)(pcie->chan[0].ring_dma >> 32),
 		       pcie->dbi_base + 0x380320);
-		dmb(oshst);
 
-		r = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
-		writel(r & ~1u, pcie->dbi_base + 0x380054);
-		dmb(oshst);
+		r = rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800A8);
+		writel(r & ~1u, pcie->dbi_base + 0x3800A8);
 
-		r = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380090);
-		writel(r | 0x10000, pcie->dbi_base + 0x380090);
+		r = rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800C4);
+		writel(r | 0x10000, pcie->dbi_base + 0x3800C4);
 		dmb(oshst);
 
 		writel(0x10001, pcie->dbi_base + 0x380058);
@@ -897,15 +910,12 @@ static void miop_pcie_bar_check_work(struct work_struct *work)
 		dmb(oshst);
 
 		r = readl(pcie->dbi_base + 0x38000C);
-		{
-			u32 *trailer_prod = (u32 *)((char *)d +
-				MIOP_DMA_RING_SIZE *
-				sizeof(struct miop_dma_desc) + 4);
-			dev_info(dev, "DMA self-test: after doorbell 0x38000C=0x%08x "
-				 "0x380010=0x%08x trailer_prod=%u\n", r,
-				 readl(pcie->dbi_base + 0x380010),
-				 *trailer_prod);
-		}
+		dev_info(dev, "DMA self-test: after init 0x38000C=0x%08x "
+			 "0x380010=0x%08x 0x3800A8=0x%08x "
+			 "0x3800C4=0x%08x\n", r,
+			 readl(pcie->dbi_base + 0x380010),
+			 readl(pcie->dbi_base + 0x3800A8),
+			 readl(pcie->dbi_base + 0x3800C4));
 
 		while (tries < 10000 && (d->status & 1)) {
 			udelay(100);
