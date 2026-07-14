@@ -353,18 +353,14 @@ static void miop_pcie_config_controller(struct miop_pcie *pcie,
 	u32 lanes = ep->hw.num_lanes ? ep->hw.num_lanes : 4;
 	u32 v, cap;
 
-	/* APB glue — factory writes to apb_base three times at probe:
-	 *   apb[0x180] = 0x100010   — APB control
-	 *   apb[0]     = 0xf00000   — APB glue (first)
-	 *   apb[0]     = 0xc000c    — APB glue (second, overwrites first)
-	 * Bits 2/3 in 0xc000c likely enable DMA channel completion IRQs. */
+	/* APB glue — factory writes three times:
+	 *   apb[0x180] = 0x100010  — APB control
+	 *   apb[0]     = 0x8000800 — APB glue (first, BEFORE link training)
+	 *   apb[0x24]  = 0x80000000
+	 * The second write (after IRQ request) uses 0xf00000 / 0xc000c. */
 	writel(0x100010, apb + 0x180);
-	writel(0xf00000, apb);
-	writel(0xc000c,  apb);
-
-	/* Enable all interrupt sources (DMA completion, doorbell, etc.)
-	 * on the APB interrupt enable register (DWC standard: +0x18). */
-	writel(0x0000ffff, apb + 0x18);
+	writel(0x8000800, apb);
+	writel(0x80000000, apb + 0x24);
 
 	writel(0x80000000, apb + 0x24);
 
@@ -895,8 +891,26 @@ static int miop_pcie_ep_probe(struct device *dev)
 	writel(0x100000, pcie->dbi_base + 0x200e14);
 	writel(0x504f494d, pcie->dbi_base + 0x200e10);
 
-	/* Trigger link training: three writes to apb_base (pcie_asm.S:2742-2754). */
+	/* Request EP IRQ BEFORE the second APB write + link training poll,
+	 * matching factory order (pcie_asm.S:2724-2735). */
+	if (ep->hw.irq > 0) {
+		int ret = devm_request_threaded_irq(dev, ep->hw.irq,
+						     rk35_ep_interrupt,
+						     NULL,
+						     IRQF_SHARED,
+						     "miop_ep_irq", pcie);
+		if (ret)
+			dev_warn(dev, "request IRQ %d failed (%d)\n",
+				 ep->hw.irq, ret);
+		else
+			dev_info(dev, "requested EP IRQ %d\n", ep->hw.irq);
+	}
+
+	/* APB glue second write: after IRQ request, factory writes
+	 * apb[0x180]=0x100010 apb[0]=0xf00000 apb[0]=0xc000c
+	 * (pcie_asm.S:2742-2754).  These trigger link-training LTSSM. */
 	if (pcie->apb_base) {
+		writel(0x100010, pcie->apb_base + 0x180);
 		writel(0xf00000, pcie->apb_base);
 		writel(0xc000c,  pcie->apb_base);
 		dev_info(pcie->dev,
@@ -908,60 +922,40 @@ static int miop_pcie_ep_probe(struct device *dev)
 	/* Bounded link-training poll. */
 	miop_pcie_link_train(pcie);
 
-	/* DMA engine init: must come after link training because the APB
-	 * glue writes (above) may reset the DMA sub-system. Factory does this
-	 * in the interrupt handler (triggered by RC doorbell after link-up). */
+	/* DMA engine init after link training (factory does this in the
+	 * interrupt handler). Keep the ring-address/DBI register writes
+	 * before link training since the factory also programs those before. */
 	{
 		int i;
 		u32 v;
 
-		/* Enable DMA engine (factory batch path line 990 / irq init line 1367). */
 		writel(1, pcie->dbi_base + 0x38000C);
-		/* Per-channel enable (factory irq init line 1438). */
 		writel(1, pcie->dbi_base + 0x38002C);
-		/* Descriptor config at ch0+0x100 offset (factory irq init line 1441). */
 		writel(0x40000308, pcie->dbi_base + 0x380300);
 		writel(0,          pcie->dbi_base + 0x380304);
-		/* Clear bit 0 of 0x3800A8 (factory irq init line 1451). */
 		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800A8);
 		writel(v & ~1u, pcie->dbi_base + 0x3800A8);
-		/* Set bit 16 of 0x3800C4 (factory irq init line 1461). */
 		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800C4);
 		writel(v | 0x10000, pcie->dbi_base + 0x3800C4);
-		/* Arm both channels (factory batch path line 1044). */
 		for (i = 0; i < MIOP_DMA_NUM_CH; i++)
 			writel(0x10001 << i, pcie->dbi_base + 0x380058);
 
 		dev_info(pcie->dev,
 			 "DMA init: buf=%p dma=%pad ring_dma[0]=%llx "
-			 "ctrl[0]=0x%02x ctrl[8]=0x%08x "
 			 "dbi=0x%08x ch_st=0x%08x "
-			 "0x21C=0x%08x 0x200=0x%08x 0x0A8=0x%08x 0x0C4=0x%08x\n",
+			 "0x21C=0x%08x 0x200=0x%08x 0x0A8=0x%08x 0x0C4=0x%08x "
+			 "apb[0x10]=0x%08x apb[0x18]=0x%08x apb[0x24]=0x%08x\n",
 			 pcie->dma_buf, &pcie->dma_dma,
 			 (u64)pcie->chan[0].ring_dma,
-			 *(u8 *)pcie->chan[0].ring,
-			 *(u32 *)((u8 *)pcie->chan[0].ring + 0xC00 + 8),
 			 readl(pcie->dbi_base + 0x38000C),
 			 readl(pcie->dbi_base + 0x38004C),
 			 readl(pcie->dbi_base + 0x38021C),
 			 readl(pcie->dbi_base + 0x380200),
 			 readl(pcie->dbi_base + 0x3800A8),
-			 readl(pcie->dbi_base + 0x3800C4));
-	}
-
-	/* Request the EP IRQ — rk35_ep_interrupt reaps DMA completions
-	 * and handles doorbells from the RC. */
-	if (ep->hw.irq > 0) {
-		int ret = devm_request_threaded_irq(dev, ep->hw.irq,
-						     rk35_ep_interrupt,
-						     rk35_ep_interrupt,
-						     IRQF_SHARED,
-						     "miop_ep_irq", pcie);
-		if (ret)
-			dev_warn(dev, "request IRQ %d failed (%d)\n",
-				 ep->hw.irq, ret);
-		else
-			dev_info(dev, "requested EP IRQ %d\n", ep->hw.irq);
+			 readl(pcie->dbi_base + 0x3800C4),
+			 readl(pcie->apb_base + 0x10),
+			 readl(pcie->apb_base + 0x18),
+			 readl(pcie->apb_base + 0x24));
 	}
 
 	dev_info(dev, "Mixtile RK35 EP probe: n_free=%u n_win=%u serial=%#x link=%s\n",
