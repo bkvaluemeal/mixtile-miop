@@ -1328,8 +1328,6 @@ static int miop_pcie_ep_probe(struct device *dev)
 		/* peer 0 is this node's own region; only TX to peers 1..3. */
 		if (i == 0)
 			continue;
-		void *va;
-		u64 db_pa, data_pa;
 		/* Node p listens for RX data at 0x90000000 + (p<<24) + (SRC<<20),
 		 * where SRC is THIS node's id (3).  Confirmed by node1's factory
 		 * boot: its TX to node2 (peer[1]) uses BAR window 0x903000000
@@ -1340,7 +1338,6 @@ static int miop_pcie_ep_probe(struct device *dev)
 		/* RX doorbell register window: 0x90000000 + peer<<24 + 0x100000
 		 * (node1's doorbell is 0x900080000, node2's 0x9000c0000). */
 		u64 db_target = 0x90000000ULL + ((u64)i << 24) + 0x100000ULL;
-		void *va;
 
 		va = miop_map_peer_bar(pcie, data_target, 0x3000000, &out_phys);
 		if (!va) {
