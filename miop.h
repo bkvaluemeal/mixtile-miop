@@ -22,10 +22,10 @@ struct miop_pcie;
 struct miop_pcie_ep_driver {
 	int (*init)(struct device *dev);
 	int (*deinit)(struct device *dev);
-	u32 (*machine_id)(struct device *dev);
-	void (*elbi_enable_irq)(struct device *dev, u32 irq_idx);
-	void (*elbi_disable_irq)(struct device *dev, u32 irq_idx);
-	void (*raise_peer_irq)(struct device *dev, u32 peer_id, u32 vector);
+	u32 (*machine_id)(struct miop_ep *ep);
+	int (*elbi_enable_irq)(struct device *dev, u32 irq_idx);
+	int (*elbi_disable_irq)(struct device *dev, u32 irq_idx);
+	int (*raise_peer_irq)(struct device *dev, u32 peer_id, u32 vector);
 	int (*dma_list_is_full)(struct device *dev, u32 channel);
 	void (*dma_list_commit_pending)(struct device *dev);
 	void *(*map_peer_bar)(struct device *dev, u32 peer, u64 phys, u32 size, u64 *out_phys);
