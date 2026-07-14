@@ -16,6 +16,9 @@
 struct miop_ep;
 struct miop_pcie;
 
+#define MIOP_DMA_RING_SIZE 128
+#define MIOP_DMA_NUM_CH 2
+
 struct miop_pcie_ep_driver {
 	int (*init)(struct device *dev);
 	int (*deinit)(struct device *dev);
@@ -77,12 +80,33 @@ struct miop_ep_hw {
 	void *net_priv;
 };
 
+/* DMA descriptor: 24 bytes */
+struct miop_dma_desc {
+	u32 status;
+	u32 len;
+	u32 addr_low;
+	u32 addr_high;
+	u16 meta_len;
+	u16 meta;
+	u32 meta2;
+};
+
+/* Shadow tracking per descriptor */
+struct miop_dma_track {
+	u64 cookie;
+	void (*cb)(u64 cookie, u64 status);
+	dma_addr_t dma;
+	u32 len;
+};
+
+#define MIOP_DMA_DESC_SIZE sizeof(struct miop_dma_desc)
+
 struct miop_pcie_channel {
-	struct miop_dma_desc *ring;              /* descriptor ring vaddr (in dma_buf) */
-	dma_addr_t ring_dma;                     /* dma address of ring */
-	u16 prod_idx;                            /* next slot to write */
-	u16 cons_idx;                            /* next slot to reap */
-	spinlock_t lock;                         /* per-channel lock */
+	struct miop_dma_desc *ring;
+	dma_addr_t ring_dma;
+	u16 prod_idx;
+	u16 cons_idx;
+	spinlock_t lock;
 	struct miop_dma_track track[MIOP_DMA_RING_SIZE];
 };
 
@@ -126,28 +150,5 @@ void miop_free_dma_skb_head(struct device *dev, struct sk_buff *skb, size_t size
 int miop_pcie_ep_resource_setup(struct platform_device *pdev, struct miop_ep_hw *hw);
 int miop_pcie_rx_region_alloc(struct device *dev, struct miop_ep_hw *hw, unsigned int idx);
 void miop_pcie_rx_region_free(struct device *dev, struct miop_ep_hw *hw, unsigned int idx);
-
-/* DMA descriptor: 24 bytes */
-struct miop_dma_desc {
-	u32 status;
-	u32 len;
-	u32 addr_low;
-	u32 addr_high;
-	u16 meta_len;
-	u16 meta;
-	u32 meta2;
-};
-
-/* Shadow tracking per descriptor */
-struct miop_dma_track {
-	u64 cookie;
-	void *cb;
-	dma_addr_t dma;
-	u32 len;
-};
-
-#define MIOP_DMA_RING_SIZE 128
-#define MIOP_DMA_DESC_SIZE sizeof(struct miop_dma_desc)
-#define MIOP_DMA_NUM_CH 2
 
 #endif /* MIOP_H */
