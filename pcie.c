@@ -488,6 +488,8 @@ static void rk35_dma_start_write(struct miop_pcie *pcie, u32 ch)
 {
 	u32 v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
 
+	dev_info(pcie->dev, "DMA doorbell: read 0x%08x write ch=%u 0x%08x\n",
+		 v, ch, (v & ~7) | ch);
 	writel((v & ~7) | ch, pcie->dbi_base + 0x380010);
 }
 
@@ -547,8 +549,8 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 
 	spin_unlock_irqrestore(&chan->lock, flags);
 
-	dev_info(pcie->dev, "dma_submit ch=%u prod=%u len=%u dma=%llx\n",
-		 ch, chan->prod_idx, len, data);
+	dev_info(pcie->dev, "dma_submit ch=%u prod=%u len=%u dma=%llx desc[%u].status=%u\n",
+		 ch, chan->prod_idx, len, data, idx, desc->status);
 	rk35_dma_start_write(pcie, ch);
 	return 0;
 }
@@ -884,10 +886,25 @@ static int miop_pcie_ep_probe(struct device *dev)
 		writel(1, pcie->dbi_base + 0x38000C);
 		/* Per-channel enable (factory irq init line 1438). */
 		writel(1, pcie->dbi_base + 0x38002C);
+		/* Descriptor config at ch0+0x100 offset (factory irq init line 1441). */
+		writel(0x40000308, pcie->dbi_base + 0x380300);
+		writel(0,          pcie->dbi_base + 0x380304);
+		/* Clear bit 0 of 0x3800A8 (factory irq init line 1451). */
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800A8);
+		writel(v & ~1u, pcie->dbi_base + 0x3800A8);
+		/* Set bit 16 of 0x3800C4 (factory irq init line 1461). */
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800C4);
+		writel(v | 0x10000, pcie->dbi_base + 0x3800C4);
 		/* Arm both channels (factory batch path line 1044, arm value
 		 * computed as (1 << ch) * 0x10001 = 0x10001 << ch). */
 		for (i = 0; i < MIOP_DMA_NUM_CH; i++)
 			writel(0x10001 << i, pcie->dbi_base + 0x380058);
+
+		dev_info(pcie->dev,
+			 "DMA init: buf=%p dma=%pad ring_dma[0]=%llx dbi=0x%08x\n",
+			 pcie->dma_buf, &pcie->dma_dma,
+			 (u64)pcie->chan[0].ring_dma,
+			 readl(pcie->dbi_base + 0x38000C));
 	}
 
 	/* MIOP tag + ring flag written to DBI (pcie_asm.S:2702-2723). */
