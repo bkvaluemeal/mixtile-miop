@@ -536,8 +536,8 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 
 	spin_unlock_irqrestore(&chan->lock, flags);
 
-	dev_dbg(pcie->dev, "dma_submit ch=%u prod=%u len=%u dma=%llx\n",
-		ch, chan->prod_idx, len, data);
+	dev_info(pcie->dev, "dma_submit ch=%u prod=%u len=%u dma=%llx\n",
+		 ch, chan->prod_idx, len, data);
 	rk35_dma_start_write(pcie, ch);
 	return 0;
 }
@@ -629,14 +629,14 @@ static irqreturn_t rk35_ep_interrupt(int irq, void *dev_id)
 
 	apb_st = readl(pcie->apb_base + 0x10);
 
-	dev_dbg(pcie->dev, "IRQ apb_st=0x%08x\n", apb_st);
+	dev_info(pcie->dev, "IRQ apb_st=0x%08x\n", apb_st);
 
 	if (apb_st & (1u << 15)) {
 		u32 db_val = rk35_pcie_readl_dbi(pcie->dbi_base, 0x200e00);
 		u32 peer = (db_val >> 8) & 0xff;
 
-		dev_dbg(pcie->dev, "IRQ doorbell db_val=0x%08x peer=%u\n",
-			db_val, peer);
+		dev_info(pcie->dev, "IRQ doorbell db_val=0x%08x peer=%u\n",
+			 db_val, peer);
 
 		ep = pcie->ep;
 		net = ep ? ep->net_drv : NULL;
@@ -653,8 +653,16 @@ static irqreturn_t rk35_ep_interrupt(int irq, void *dev_id)
 		}
 	}
 
-	miop_dma_try_reap(pcie, 0);
-	miop_dma_try_reap(pcie, 1);
+	{
+		int reaped = miop_dma_try_reap(pcie, 0);
+		if (reaped)
+			dev_info(pcie->dev, "IRQ reaped %d on ch0\n", reaped);
+	}
+	{
+		int reaped = miop_dma_try_reap(pcie, 1);
+		if (reaped)
+			dev_info(pcie->dev, "IRQ reaped %d on ch1\n", reaped);
+	}
 
 	writel(apb_st, pcie->apb_base + 0x10);
 	return IRQ_HANDLED;
