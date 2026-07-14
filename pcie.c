@@ -493,6 +493,9 @@ static void rk35_dma_start_write(struct miop_pcie *pcie, u32 ch)
 	writel((v & ~7) | ch, pcie->dbi_base + 0x380010);
 }
 
+static void rk35_dma_start_write(struct miop_pcie *pcie, u32 ch);
+static int miop_dma_try_reap(struct miop_pcie *pcie, u32 ch);
+
 /*
  * miop_rk35_dma_submit() — submit one DMA descriptor.
  * Translated from pcie_asm.S line 19.
