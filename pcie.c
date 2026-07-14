@@ -480,30 +480,41 @@ static int miop_pcie_link_train(struct miop_pcie *pcie)
 static void rk35_dma_start_write(struct miop_pcie *pcie, u32 ch)
 {
 	u32 v;
+	u32 base = 0x380000 + ch * 0x200;
+	dma_addr_t ring_dma = pcie->chan[ch].ring_dma;
 
-	/* Factory batch path lines 990-1044, in order:
-	 *   1. Re-enable DMA engine (0x38000C = 1)
-	 *   2. Clear doorbell pending bits for this channel (0x380054)
-	 *   3. Enable per-channel interrupt (0x380090)
-	 *   4. Arm channel (0x380058)
-	 *   5. Doorbell (0x380010)
-	 */
-	u32 ch_mask = 1u << ch;
-
+	/* Factory batch path lines 990-1044 — exact order: */
+	/* 1. Re-enable DMA write engine */
 	writel(1, pcie->dbi_base + 0x38000C);
 	dmb(oshst);
 
+	/* 2. Re-program ring address (batch path writes it every time) */
+	writel(0x40000308, pcie->dbi_base + base + 0x200);
+	writel(0,          pcie->dbi_base + base + 0x204);
+	writel((u32)ring_dma, pcie->dbi_base + base + 0x21C);
+	writel((u32)(ring_dma >> 32), pcie->dbi_base + base + 0x220);
+	/* Read-channel registers (interrupt handler also programs these) */
+	writel(0x40000308, pcie->dbi_base + base + 0x300);
+	writel(0,          pcie->dbi_base + base + 0x304);
+	writel((u32)ring_dma, pcie->dbi_base + base + 0x31C);
+	writel((u32)(ring_dma >> 32), pcie->dbi_base + base + 0x320);
+	dmb(oshst);
+
+	/* 3. Clear doorbell pending bits for this channel */
 	v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
-	writel(v & ~ch_mask, pcie->dbi_base + 0x380054);
+	writel(v & ~(1u << ch), pcie->dbi_base + 0x380054);
 	dmb(oshst);
 
+	/* 4. Enable per-channel interrupt */
 	v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380090);
-	writel(v | (ch_mask << 16), pcie->dbi_base + 0x380090);
+	writel(v | (1u << (16 + ch)), pcie->dbi_base + 0x380090);
 	dmb(oshst);
 
-	writel(ch_mask | (ch_mask << 16), pcie->dbi_base + 0x380058);
+	/* 5. Arm channel */
+	writel((1u << ch) | (1u << (16 + ch)), pcie->dbi_base + 0x380058);
 	dmb(oshst);
 
+	/* 6. Doorbell — matches rk35_dma_start_write in factory */
 	v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
 	writel((v & ~7) | ch, pcie->dbi_base + 0x380010);
 }
