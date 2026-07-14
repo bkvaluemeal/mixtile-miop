@@ -210,13 +210,15 @@ EXPORT_SYMBOL(miop_ep_unmap_outbound_atu);
  * `size` is the window size, `extra` an added offset folded into the limit.
  * Returns 0 on success, -EINVAL if no free window.
  */
-int miop_ep_map_outbound_atu(struct miop_pcie *pcie, u32 target, u32 size, u32 extra)
+int miop_ep_map_outbound_atu(struct miop_pcie *pcie, u64 target, u32 size, u32 extra)
 {
 	struct miop_ep *ep = pcie->ep;
 	unsigned long n_win = ep->n_win;
 	unsigned long bit;
 	void *win;
 	int tries = 5;
+	u32 t_lo = (u32)(target & 0xffffffff);
+	u32 t_hi = (u32)(target >> 32);
 
 	bit = find_first_zero_bit(pcie->map2, n_win);
 	if (bit >= n_win) {
@@ -225,24 +227,24 @@ int miop_ep_map_outbound_atu(struct miop_pcie *pcie, u32 target, u32 size, u32 e
 	}
 
 	win = (char *)pcie->atu_base + (bit << 9);
-	/* The factory's sequence wrote 0 to win+0x0 (the outbound window's SOURCE
-	 * / base address register). Without a defined source, a CPU write to the
-	 * mapped address is never translated onto the fabric. The factory passes
-	 * phys as the target and uses an identity map (source == target), so write
-	 * the source base here. The remaining target/limit/size/enable writes are
-	 * kept from the factory sequence. */
-	writel(target, (char *)win + 0x0);          /* source / base lower */
-	writel(target, (char *)win + 0x8);
-	writel(0, (char *)win + 0xc);
-	writel(target - 1 + extra, (char *)win + 0x10);
-	writel(size, (char *)win + 0x14);
-	writel(0, (char *)win + 0x18);
-	writel(0x80000000, (char *)win + 0x4);
+	/* Identity outbound map: source (local CPU) address == target (fabric)
+	 * address, so a CPU write into the ioremapped window is translated onto
+	 * the fabric at `target`.  Both the 64-bit source base and the 64-bit
+	 * target must be programmed (low 32 at +0x0/+0x8, high 32 at +0x4/+0xc)
+	 * or a 64-bit target such as 0x901000000 gets truncated. */
+	writel(t_lo, (char *)win + 0x0);          /* source / base lower */
+	writel(t_hi, (char *)win + 0x4);          /* source / base upper */
+	writel(t_lo, (char *)win + 0x8);          /* target lower */
+	writel(t_hi, (char *)win + 0xc);          /* target upper */
+	writel((u32)((target - 1 + extra) & 0xffffffff), (char *)win + 0x10);
+	writel((u32)((target - 1 + extra) >> 32), (char *)win + 0x14);
+	writel(size, (char *)win + 0x18);
+	writel(0x80000000, (char *)win + 0x1c);
 
 	while (tries--) {
 		int i;
 		for (i = 0; i < 9; i++) {
-			if (readl((char *)win + 0x4) & (1u << 31))
+			if (readl((char *)win + 0x1c) & (1u << 31))
 				goto enabled;
 			udelay(250);
 		}
@@ -250,8 +252,8 @@ int miop_ep_map_outbound_atu(struct miop_pcie *pcie, u32 target, u32 size, u32 e
 
 	dev_err(pcie->dev, "outbound ATU enable timeout (win %lu)\n", bit);
 enabled:
-	dev_err(pcie->dev, "outbound free_win %lu target %#x size %#x\n",
-		bit, target, size);
+	dev_err(pcie->dev, "outbound free_win %lu target %#llx size %#x\n",
+		bit, (unsigned long long)target, size);
 
 	set_bit(bit, pcie->map2);
 	pcie->addrs[bit] = target;
