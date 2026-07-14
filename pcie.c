@@ -1325,6 +1325,7 @@ static int miop_pcie_ep_probe(struct device *dev)
 
 	for (i = 0; i < 4; i++) {
 		u64 out_phys = 0;
+		void *va;
 		/* peer 0 is this node's own region; only TX to peers 1..3. */
 		if (i == 0)
 			continue;
