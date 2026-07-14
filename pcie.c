@@ -624,6 +624,10 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 		 * RX ring). */
 		memcpy_toio(win, (void *)(unsigned long)data, len);
 		wmb();
+		dev_info(pcie->dev, "TX peer=%d len=%u win_va=%px "
+			 "data_dma=0x%llx db_va=%px\n", p, len,
+			 win, (unsigned long long)win_dma,
+			 pcie->peer_db_base[p]);
 
 		spin_lock_irqsave(&chan->lock, flags);
 		idx = chan->prod_idx;
@@ -804,9 +808,12 @@ int miop_raise_peer_irq(struct device *dev, u32 peer_id, u32 vector)
 	 * Transcribed from pcie_asm.S miop_raise_peer_irq: writes to
 	 * peer_bar_base + peer_bar_phys. */
 	db = (char __iomem *)pcie->peer_db_base[peer_id] + pcie->peer_db_off[peer_id];
-	/* Doorbell value: bit[1]=RX-ready, bits[8:15]=source peer id
-	 * (factory rx_ep_interrupt decodes peer from db_val>>8). */
-	writel((vector & 0xff) | ((peer_id & 0xff) << 8), db);
+	/* Doorbell value: bit[1] (0x2) = RX_DATA (miop_ep_handle_doorbell only
+	 * calls on_rx when db_val & 2), bits[8:15] = source peer id (the peer
+	 * decodes the sender from db_val>>8). */
+	dev_info(pcie->dev, "DOORBELL peer=%u -> db_va=%px val=0x%08x\n",
+		 peer_id, db, (0x2 | ((peer_id & 0xff) << 8)));
+	writel(0x2 | ((peer_id & 0xff) << 8), db);
 	return 0;
 }
 
