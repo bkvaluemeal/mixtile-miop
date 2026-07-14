@@ -948,6 +948,16 @@ static void *miop_rk35_map_peer_bar(struct device *dev, u32 peer,
 	if (peer >= 4 || !phys)
 		return NULL;
 
+	/* Mirror the factory: program an outbound iATU window that translates a
+	 * local CPU write at `phys` onto the fabric at `phys` (identity map, as
+	 * the factory passes phys as the ATU target), then ioremap the same
+	 * address so raise_peer_irq's doorbell write crosses the fabric. */
+	if (miop_ep_map_outbound_atu(pcie, (u32)(phys & 0xffffffff),
+				     size ? size : 0x1000000, 0)) {
+		dev_warn(dev, "map_peer_bar: outbound ATU failed peer=%u\n", peer);
+		return NULL;
+	}
+
 	/* Map the peer's EP DBI/ELBI window so raise_peer_irq can write the
 	 * doorbell into it (transcribed from pcie_asm.S map_peer_bar /
 	 * miop_raise_peer_irq).  The net driver passes the peer's doorbell
