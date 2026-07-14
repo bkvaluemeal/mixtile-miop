@@ -399,7 +399,7 @@ static void miop_pcie_config_controller(struct miop_pcie *pcie,
 	writel(v | 0x1, dbi + 0x8bc);
 
 	/* set_bar x4 (EP BARs) — inside the enabled window, before IDs */
-	miop_pcie_ep_set_bar(pcie, 0, 0x2000000, 0xc);
+	miop_pcie_ep_set_bar(pcie, 0, 0x10000, 0x8); /* 64K, 32-bit prefetch — might fit controller's bridge */
 	miop_pcie_ep_set_bar(pcie, 2, 0, 0);
 	miop_pcie_ep_set_bar(pcie, 3, 0, 0);
 	miop_pcie_ep_set_bar(pcie, 4, 0x100000, 0xc);
