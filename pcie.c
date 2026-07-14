@@ -563,6 +563,15 @@ static int miop_pcie_ep_probe(struct device *dev)
 	/* Controller / DLL configuration (DBI/APB pokes). */
 	miop_pcie_config_controller(pcie, ep);
 
+	/* Trigger link training: three writes to dbi_base2 (pcie_asm.S:2742-2754).
+	 * Factory struct has dbi_base2 at +16, apb_base at +24; in our struct
+	 * the offsets are swapped, so target pcie->dbi_base2 explicitly. */
+	if (pcie->dbi_base2) {
+		writel(0x100010, pcie->dbi_base2 + 0x180);
+		writel(0xf00000, pcie->dbi_base2);
+		writel(0xc000c,  pcie->dbi_base2);
+	}
+
 	/* Bounded link-training poll. */
 	miop_pcie_link_train(pcie);
 
