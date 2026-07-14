@@ -1020,6 +1020,7 @@ static int miop_pcie_ep_probe(struct device *dev)
 	{
 		struct miop_dma_desc *d = pcie->chan[0].ring;
 		int tries;
+		u32 v;
 
 		/* Dump key DMA registers */
 		dev_info(dev, "DMA regs: 0x000=0x%08x 0x00C=0x%08x 0x010=0x%08x "
