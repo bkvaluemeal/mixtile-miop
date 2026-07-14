@@ -119,6 +119,11 @@ struct miop_pcie {
 	u64 *addrs;			/* per-window mapped target low (kcalloc) */
 	void *dma_buf;		/* 0x400000 TX/DMA coherent buffer (CPU va) */
 	dma_addr_t dma_dma;		/* 0x400000 TX/DMA buffer bus address */
+	void __iomem *peer_bar_base;	/* ioremap of the peer-BAR shared region */
+	u64 peer_bar_phys;		/* bus address of the peer-BAR region */
+	int link_slot;			/* allocated outbound/peer slot index */
+	u32 serial;			/* per-blade serial (miop_ep_generate_serial) */
+	int link_up;			/* non-zero once the LTSSM reports link up */
 };
 
 /* struct miop_ep - per-blade endpoint context. */

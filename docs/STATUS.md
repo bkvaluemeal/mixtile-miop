@@ -48,20 +48,51 @@ feeds `ep->n_free`/`n_win` from `hw->num_ob_windows`.
 ### pcie-ep-rk35.ko — stubbed / TODO (the probe)
 `miop_pcie_ep_init()` (factory `pcie.S` ~line 2260, ~880 lines of asm) is
 the link-bring-up core. **Status:** phases 1–3 (ioremap DBI/APB, window-map
-init, DMA buffer) are WIRED and verified. Remaining phases (transcribe from
-`pcie.S`, each a verifiable increment):
+init, DMA buffer) are WIRED and verified. Phase 5/11/10 core (DBI/APB config
+block, bounded link-training poll, stub IRQ) are now WIRED and verified (see
+verification log). Remaining phases (transcribe from `pcie.S`, each a
+verifiable increment):
 
-4. `miop_ep_generate_serial` — derive serial (→ MAC).
-5. `rk35_pcie_readl_dbi` — read/configure DBI registers.
-6. `rk35_pcie_ep_set_bar` ×4 — configure EP BARs.
-7. `find_first_zero_bit` — allocate per-peer/ring slots.
-8. `ioremap` — map peer BAR / RC staging regions.
-9. `dma_alloc_attrs` ×2 — more DMA regions.
-10. `devm_request_threaded_irq` — `rk35_ep_interrupt` handler.
-11. link-training poll: `readl` + `msleep` until `PCIe Link up`.
-12. `ioremap` ×2 — RC staging + peer BAR mapping (`miop_rk35_map_rc_staging`, `miop_rk35_map_peer_bar`).
+4. `miop_ep_generate_serial` — **DONE** (serial stored in `pcie->serial`,
+   MIOP shared header written at start of the 4 MiB DMA buffer).
+5. `rk35_pcie_readl_dbi` — read/configure DBI registers — **DONE** (DBI/APB
+   controller-config block transcribed: APB glue, RK APP 0x380054/0xa8 clears,
+   DBI 0x710 link-cap width, 0x80c link speed, 0x4, 0x0/0x2/0xc EP identity,
+   0x8bc enable toggle).
+6. `rk35_pcie_ep_set_bar` ×4 — configure EP BARs. **STUBBED** (logs, no-op).
+   The original computed the BAR register offset from a per-controller base
+   (`rockchip_pcie+0x20`, assumed `num_ob_windows*8` = 0x80); to be wired
+   next pass against our raw `dbi_base`.
+7. `find_first_zero_bit` — allocate per-peer/ring inbound slot + program the
+   inbound iATU window (`atu_base + bit<<9`). **STUBBED** (skipped this pass).
+8. `ioremap` — map peer BAR / RC staging regions. **STUBBED**.
+9. `dma_alloc_attrs` ×2 — more DMA regions (peer-desc rings). **STUBBED**.
+10. `devm_request_threaded_irq` — `rk35_ep_interrupt` handler. **WIRED** with a
+    minimal stub handler that clears the APB status reg (`apb+0x10`) and
+    returns `IRQ_HANDLED` (no DMA reap / handshake yet — prevents storm).
+11. link-training poll: `readl(apb+0x300)` + `msleep(20)` until status matches
+    `0x11 | (0x3<<16)` (mask `0x3f|(0x3<<16)`), bounded to `MIOP_LINK_TRAIN_ITERS`
+    (250 → ~5 s) so a missing peer can never hang boot. **WIRED + verified**
+    (graceful timeout when peer/switch not reset).
+12. `ioremap` ×2 — RC staging + peer BAR mapping (`miop_rk35_map_rc_staging`, `miop_rk35_map_peer_bar`). **STUBBED**.
 13. outbound ATU: `miop_ep_map_outbound_atu` (`outbound free_win` messages).
-14. peer handshake → calls `net_drv->on_peer_online()` → `Node online` / `tx staging` / `new-arch init`.
+    Helpers exist; not yet driven by the link-up path.
+14. peer handshake → calls `net_drv->on_peer_online()` → `Node online` / `tx staging` / `new-arch init`. **STUBBED** (lives in `rk35_ep_interrupt`, not wired).
+
+**Key runtime finding (2026-07-12):** `fe150000.pcie` is bound to **our**
+`miop-ep` driver and there is **no** kernel PCIe EP framework in use
+(`/sys/class/pci_epc` empty; `rk-pcie`/`dw-pcie` not bound to the
+controller). Therefore our `pcie_ep_rk35.ko` is the *complete* EP controller
+driver and the asm's DBI/APB pokes are safe to reproduce against
+`pcie->dbi_base`/`pcie->apb_base`. The asm reached the controller through a
+`struct rockchip_pcie` handle only for `set_bar`/`raise_irq`/`map_*`, which we
+rewrite against our raw mmio.
+
+**Link-training caveat:** a *direct node2 reboot* does **not** reset the
+shared ASM2824 NTB switch, so the switch↔node2 link cannot retrain even when
+node3 (RC, `10.20.0.4`) is up. To actually observe `PCIe Link up`, a **full
+cluster power cycle** (controller reboot) is required — this is the only way
+to validate the LTSSM/training path.
 
 Helper functions already present in `pcie.S` to translate:
 `miop_rk35_dma_submit`, `miop_rk35_dma_submit_batch`, `miop_ep_map_outbound_atu`,
@@ -85,6 +116,13 @@ Helper functions already present in `pcie.S` to translate:
   reboot, banners present, no oops/BUG.
 - `pcie.c` probe early stage wired (ioremap DBI/APB, window_map_init, 4 MiB
   DMA): verified direct node2 reboot, prints `n_free=16 n_win=16`, no oops.
+- `pcie.c` probe controller-config + bounded link-training + stub IRQ wired:
+  verified clean reload (all 4 modules load, **no oops/panic, no IRQ storm**).
+  Probe runs the full new path; link-training polls `apb+0x300` and times out
+  gracefully (~5 s, bounded) because the peer/switch wasn't reset (node2-only
+  reboot; node3 RC *was* up but switch↔node2 link can't retrain without a full
+  power cycle). Serial `0x58c184bf` reported. Next: a full cluster power cycle
+  is needed to confirm the link actually trains with this config.
 
 ## Next increments
 1. Implement `miop_pcie_ep_init()` phases in order, testing after each

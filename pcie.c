@@ -26,11 +26,13 @@
 #include <linux/delay.h>
 #include <linux/platform_device.h>
 #include <linux/dma-mapping.h>
+#include <linux/interrupt.h>
+#include <linux/of_irq.h>
 
 #include "miop.h"
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Mixtile TCP/IP over PCIe RK35 EP driver (thin C pass)");
+MODULE_DESCRIPTION("Mixtile TCP/IP over PCIe RK35 EP driver (C pass)");
 
 /*
  * miop_ep_generate_serial() / miop_ep_machine_id() - serial & MAC id.
@@ -241,6 +243,147 @@ enabled:
 EXPORT_SYMBOL(miop_ep_map_outbound_atu);
 
 /*
+ * miop_pcie_ep_set_bar() - program one EP BAR (translated from pcie.S
+ * rk35_pcie_ep_set_bar.isra.0). The original operated on the vendor's
+ * struct rockchip_pcie (dbi_base @0, apb_base @8); here we drive our raw
+ * mmio directly. NOTE: the original computed the BAR register offset from a
+ * per-controller base (rockchip_pcie+0x20) that we do not yet reconstruct, so
+ * for this pass the BAR table is assumed to start at the DBI header (offset 0)
+ * with one 8-byte slot per BAR index. This is stubbed to a no-op with a log so
+ * the link can still train; the real BAR layout is wired in a later pass.
+ */
+static void miop_pcie_ep_set_bar(struct miop_pcie *pcie, int bar,
+				 u64 size, int flags)
+{
+	dev_info(pcie->dev, "set_bar(bar=%d size=%#llx flags=%#x) [stub]\n",
+		 bar, size, flags);
+}
+
+/*
+ * miop_pcie_config_controller() - the controller/DLL configuration block
+ * transcribed from pcie.S miop_pcie_ep_init (lines ~2527-2628). Pure mmio
+ * pokes against pcie->dbi_base / pcie->apb_base; safe on our owned controller.
+ *
+ *  - APB glue: app base + 0x24 control bits.
+ *  - DBI 0x380000 (RK APP) region: clear 0x54/0xa8.
+ *  - DBI 0x710: link capability width (from num_lanes) + class/type bits.
+ *  - DBI 0x80c: max link speed (from num_lanes).
+ *  - DBI 0x8bc: EP/controller enable toggle.
+ *  - DBI 0x4:  GEN/type register = 6.
+ *  - DBI 0x0/0x2/0xc: Vendor/Device/Class of the EP function.
+ */
+static void miop_pcie_config_controller(struct miop_pcie *pcie,
+					struct miop_ep *ep)
+{
+	void __iomem *dbi = pcie->dbi_base;
+	void __iomem *apb = pcie->apb_base;
+	u32 lanes = ep->hw.num_lanes ? ep->hw.num_lanes : 4;
+	u32 v, cap;
+
+	/* APB glue. */
+	writel(0x8000800, apb);
+	writel(0x80000000, apb + 0x24);
+
+	/* RK APP region (DBI + 0x380000): clear two control registers. */
+	writel(0, dbi + 0x380000 + 0x54);
+	writel(0, dbi + 0x380000 + 0xa8);
+
+	/* DBI 0x710: preserve type/class bits, set link capability width. */
+	v = rk35_pcie_readl_dbi(dbi, 0x710);
+	v = (v & 0xffffff7f) | 0x20;
+	switch (lanes) {
+	case 1:  cap = 0x10000; break;
+	case 2:  cap = 0x30000; break;
+	case 4:  cap = 0x70000; break;
+	default:
+		if (lanes > 4)
+			cap = 0xf0000;
+		else
+			cap = 0x30000; /* lanes==3 et al: leave as x2 */
+		dev_info(pcie->dev, "unusual num_lanes=%u, using cap %#x\n",
+			 lanes, cap);
+		break;
+	}
+	writel((v & 0xffc0ffff) | cap, dbi + 0x710);
+
+	/* DBI 0x80c: max link speed from num_lanes. */
+	v = rk35_pcie_readl_dbi(dbi, 0x80c);
+	v &= 0xffffe0ff;
+	switch (lanes) {
+	case 1:  v |= 0x10000; break;
+	case 2:  v |= 0x20000; break;
+	case 4:  v |= 0x40000; break;
+	default: v |= 0x20000; break;
+	}
+	writel(v, dbi + 0x80c);
+
+	writel(6, dbi + 0x4);
+
+	/* EP function identity (type0 config header). */
+	writew(0x4586, dbi + 0x0);
+	writew(0xb6f2, dbi + 0x2);
+	writew(0x280,  dbi + 0xc);
+
+	/* Controller enable toggle (0x8bc = 1, then 0 after id writes). */
+	v = rk35_pcie_readl_dbi(dbi, 0x8bc);
+	writel(v | 0x1, dbi + 0x8bc);
+	/* set_bar x4 (STUBBED for this pass). */
+	miop_pcie_ep_set_bar(pcie, 0, 0x2000000, 0xc);
+	miop_pcie_ep_set_bar(pcie, 2, 0, 0);
+	miop_pcie_ep_set_bar(pcie, 3, 0, 0);
+	miop_pcie_ep_set_bar(pcie, 4, 0x100000, 0xc);
+	v = rk35_pcie_readl_dbi(dbi, 0x8bc);
+	writel(v & ~0x1, dbi + 0x8bc);
+}
+
+/*
+ * miop_pcie_link_train() - bounded LTSSM link-training poll, transcribed from
+ * pcie.S (apb_base+0x300 link-status register). Bounded to LINK_TRAIN_ITERS so
+ * a missing peer can never hang boot; returns 0 if link came up, -ETIMEDOUT
+ * otherwise (non-fatal: the module still loads).
+ */
+#define MIOP_LINK_TRAIN_ITERS 250
+static int miop_pcie_link_train(struct miop_pcie *pcie)
+{
+	void __iomem *apb = pcie->apb_base;
+	u32 mask = 0x3f | (0x3u << 16);
+	u32 want = 0x11 | (0x3u << 16);
+	int i;
+
+	for (i = 0; i < MIOP_LINK_TRAIN_ITERS; i++) {
+		u32 st = readl(apb + 0x300);
+
+		if ((st & mask) == want) {
+			pcie->link_up = 1;
+			dev_info(pcie->dev, "PCIe Link up (status %#x)\n", st);
+			return 0;
+		}
+		msleep(20);
+	}
+	dev_warn(pcie->dev, "PCIe Link training timed out (no peer?)\n");
+	return -ETIMEDOUT;
+}
+
+/*
+ * miop_ep_irq_stub() - minimal IRQ handler. The vendor's real handler
+ * (rk35_ep_interrupt) reaps the DMA rings and drives the peer handshake; that
+ * is wired in a later pass. Here we clear the APB status register
+ * (apb+0x10, written back to clear) so a level-triggered line cannot storm,
+ * and report handled.
+ */
+static irqreturn_t miop_ep_irq_stub(int irq, void *dev_id)
+{
+	struct miop_pcie *pcie = dev_id;
+
+	if (pcie && pcie->apb_base) {
+		u32 st = readl(pcie->apb_base + 0x10);
+
+		writel(st, pcie->apb_base + 0x10);
+	}
+	return IRQ_HANDLED;
+}
+
+/*
  * miop_pcie_ep_probe() - RK35 EP bring-up, called by miop-ep.ko.
  *
  * Early/structural bring-up transcribed from pcie.S miop_pcie_ep_init:
@@ -302,8 +445,44 @@ static int miop_pcie_ep_probe(struct device *dev)
 	pcie->dma_buf = dma_buf;
 	pcie->dma_dma = dma_dma;
 
-	dev_info(dev, "Mixtile RK35 EP probe: n_free=%u n_win=%u\n",
-		 ep->n_free, ep->n_win);
+	/* MIOP shared header at the start of the DMA buffer (peer handshake
+	 * region). Mirrors pcie.S: hdr[0]="MIOP"+0x2, hdr[1]=serial,
+	 * hdr[3]=0xffffffff, hdr[4]=1, hdr[5]=0. */
+	pcie->serial = miop_ep_generate_serial();
+	{
+		u64 *hdr = dma_buf;
+
+		hdr[0] = 0x00020000504f494dULL;       /* "MIOP" | 0x2 */
+		hdr[1] = pcie->serial;
+		*(u32 *)((char *)dma_buf + 12) = 0xffffffff;
+		*(u64 *)((char *)dma_buf + 16) = 1;  /* low=1, high=0 */
+		wmb();
+	}
+
+	/* Controller / DLL configuration (DBI/APB pokes). */
+	miop_pcie_config_controller(pcie, ep);
+
+	/* Bounded link-training poll. */
+	miop_pcie_link_train(pcie);
+
+	/* Request the EP "sys" IRQ with a stub handler (clears status). The real
+	 * DMA-reap / peer-handshake handler is wired in a later pass. */
+	if (ep->hw.irq > 0) {
+		int ret = devm_request_threaded_irq(dev, ep->hw.irq,
+						     miop_ep_irq_stub,
+						     miop_ep_irq_stub,
+						     IRQF_SHARED,
+						     "miop_ep_irq", pcie);
+		if (ret)
+			dev_warn(dev, "request IRQ %d failed (%d)\n",
+				 ep->hw.irq, ret);
+		else
+			dev_info(dev, "requested EP IRQ %d\n", ep->hw.irq);
+	}
+
+	dev_info(dev, "Mixtile RK35 EP probe: n_free=%u n_win=%u serial=%#x link=%s\n",
+		 ep->n_free, ep->n_win, pcie->serial,
+		 pcie->link_up ? "up" : "down");
 
 	return 0;
 }
