@@ -858,8 +858,9 @@ static int miop_pcie_ep_probe(struct device *dev)
 	miop_pcie_config_controller(pcie, ep);
 
 	/* Program per-channel DMA ring address + descriptor config into the
-	 * DBI APP region registers (pcie_asm.S batch-submit path lines 995-1014).
-	 * Without this the DMA engine cannot locate the descriptor ring. */
+	 * DBI APP region registers (pcie_asm.S interrupt handler lines 1389-1483).
+	 * Both write-channel (0x200) and read-channel (0x300) ring addresses
+	 * must be programmed for the engine to process descriptors. */
 	{
 		int i;
 		u32 v;
@@ -868,10 +869,16 @@ static int miop_pcie_ep_probe(struct device *dev)
 			u32 base = 0x380000 + i * 0x200;
 			dma_addr_t dma = pcie->chan[i].ring_dma;
 
+			/* Write channel (TX) */
 			writel(0x40000308, pcie->dbi_base + base + 0x200);
 			writel(0,          pcie->dbi_base + base + 0x204);
 			writel((u32)dma,   pcie->dbi_base + base + 0x21C);
 			writel((u32)(dma >> 32), pcie->dbi_base + base + 0x220);
+			/* Read channel (RX) - same ring */
+			writel(0x40000308, pcie->dbi_base + base + 0x300);
+			writel(0,          pcie->dbi_base + base + 0x304);
+			writel((u32)dma,   pcie->dbi_base + base + 0x31C);
+			writel((u32)(dma >> 32), pcie->dbi_base + base + 0x320);
 		}
 
 		/* Enable per-channel interrupts in DBI+0x380090 (factory line 1031). */
@@ -890,6 +897,13 @@ static int miop_pcie_ep_probe(struct device *dev)
 	/* MIOP tag + ring flag written to DBI (pcie_asm.S:2702-2723). */
 	writel(0x100000, pcie->dbi_base + 0x200e14);
 	writel(0x504f494d, pcie->dbi_base + 0x200e10);
+
+	/* Clear any stale APB interrupt status bits before IRQ is requested. */
+	if (pcie->apb_base) {
+		u32 st = readl(pcie->apb_base + 0x10);
+		if (st)
+			writel(st, pcie->apb_base + 0x10);
+	}
 
 	/* Request EP IRQ BEFORE the second APB write + link training poll,
 	 * matching factory order (pcie_asm.S:2724-2735). */
@@ -946,7 +960,8 @@ static int miop_pcie_ep_probe(struct device *dev)
 		dev_info(pcie->dev,
 			 "DMA init: buf=%p dma=%pad ring_dma[0]=%llx "
 			 "dbi=0x%08x ch_st=0x%08x "
-			 "0x21C=0x%08x 0x200=0x%08x 0x0A8=0x%08x 0x0C4=0x%08x "
+			 "0x21C=0x%08x 0x31C=0x%08x 0x200=0x%08x "
+			 "0x0A8=0x%08x 0x0C4=0x%08x "
 			 "apb=%p apb[0x10]=0x%08x apb[0x18]=0x%08x "
 			 "apb[0x24]=0x%08x wr24=0x%08x\n",
 			 pcie->dma_buf, &pcie->dma_dma,
@@ -954,6 +969,7 @@ static int miop_pcie_ep_probe(struct device *dev)
 			 readl(pcie->dbi_base + 0x38000C),
 			 readl(pcie->dbi_base + 0x38004C),
 			 readl(pcie->dbi_base + 0x38021C),
+			 readl(pcie->dbi_base + 0x38031C),
 			 readl(pcie->dbi_base + 0x380200),
 			 readl(pcie->dbi_base + 0x3800A8),
 			 readl(pcie->dbi_base + 0x3800C4),
