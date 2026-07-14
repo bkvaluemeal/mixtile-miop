@@ -881,8 +881,6 @@ static int miop_pcie_ep_probe(struct device *dev)
 			struct miop_pcie_channel *ch = &pcie->chan[i];
 			size_t ring_sz = MIOP_DMA_RING_SIZE *
 					 sizeof(struct miop_dma_desc);
-			u8 *ctrl;
-			int j;
 
 			ch->ring = (struct miop_dma_desc *)((char *)dma_buf +
 							    0x100000 + i * ring_sz);
@@ -890,15 +888,6 @@ static int miop_pcie_ep_probe(struct device *dev)
 			ch->prod_idx = 0;
 			ch->cons_idx = 0;
 			spin_lock_init(&ch->lock);
-
-			/* Control trailer at ring + 0xC00 */
-			ctrl = (u8 *)ch->ring + ring_sz;
-			ctrl[0] = 0x05;
-			*(u32 *)(ctrl + 8) = (u32)ch->ring_dma;
-			*(u32 *)(ctrl + 12) = 0;
-			for (j = 1; j < 8; j++)
-				ctrl[j] = 0;
-			dmb(oshst);
 		}
 	}
 
@@ -1031,6 +1020,61 @@ static int miop_pcie_ep_probe(struct device *dev)
 	dev_info(dev, "Mixtile RK35 EP probe: n_free=%u n_win=%u serial=%#x link=%s\n",
 		 ep->n_free, ep->n_win, pcie->serial,
 		 pcie->link_up ? "up" : "down");
+
+	/* DMA self-test: write a minimal descriptor and doorbell */
+	{
+		struct miop_dma_desc *d = pcie->chan[0].ring;
+		u32 v, r;
+		int tries = 0;
+
+		memset(d, 0, sizeof(*d));
+		d->len = 8;
+		d->addr_low = (u32)pcie->dma_dma;
+		d->addr_high = 0;
+		wmb();
+		d->status = 1;
+		wmb();
+
+		/* Verify register access works */
+		r = readl(pcie->dbi_base + 0x380000);
+		dev_info(dev, "DMA test: 0x380000=0x%08x\n", r);
+		r = readl(pcie->dbi_base + 0x38000C);
+		dev_info(dev, "DMA test: before 0x38000C=0x%08x\n", r);
+
+		writel(1, pcie->dbi_base + 0x38000C);
+		r = readl(pcie->dbi_base + 0x38000C);
+		dev_info(dev, "DMA test: after  0x38000C=0x%08x\n", r);
+
+		writel(0x40000308, pcie->dbi_base + 0x380200);
+		dmb(oshst);
+
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
+		writel(v & ~1u, pcie->dbi_base + 0x380054);
+		dmb(oshst);
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380090);
+		writel(v | 0x10000, pcie->dbi_base + 0x380090);
+		dmb(oshst);
+		writel(0x10001, pcie->dbi_base + 0x380058);
+		dmb(oshst);
+
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
+		dev_info(dev, "DMA test: pre-doorbell 0x380010=0x%08x\n", v);
+		writel((v & ~7) | 0, pcie->dbi_base + 0x380010);
+		r = readl(pcie->dbi_base + 0x380010);
+		dev_info(dev, "DMA test: post-doorbell 0x380010=0x%08x\n", r);
+
+		while (tries < 1000 && (d->status & 1)) {
+			udelay(100);
+			tries++;
+		}
+		dev_info(dev, "DMA self-test: status=%u after %dms "
+			 "0x38000C=0x%08x 0x38004C=0x%08x "
+			 "apb[0x10]=0x%08x\n",
+			 d->status, tries * 100 / 1000,
+			 readl(pcie->dbi_base + 0x38004C),
+			 readl(pcie->dbi_base + 0x38004C),
+			 readl(pcie->apb_base + 0x10));
+	}
 
 	return 0;
 }
