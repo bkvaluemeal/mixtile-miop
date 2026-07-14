@@ -23,6 +23,21 @@ Current node2 boot state: our `ep` + `reg` + thin `net` + thin `pcie` →
 - `miop_ep_generate_serial()` — serial-mixing hash (from `pcie.S`).
 - `miop_ep_machine_id()` — walks `ep+0x78` → `+0x148`; returns the cached
   id or falls back to `miop_ep_generate_serial()`. Exported.
+- `rk35_pcie_readl_dbi()` / `rk35_pcie_readw_dbi()` — DBI accessors
+  (asm had a decompiler self-loop artifact; real op is just the read).
+- `rk35_pcie_ep_window_map_init()` / `_deinit()` — allocate/kfree the three
+  window bitmaps/arrays (offsets 0x38/0x40/0x48).
+- `miop_ep_map_outbound_atu()` — program one outbound iATU window (offset
+  0x20 base, 0x200 stride, enable poll on bit31), set the alloc bit, store
+  the target in `addrs[]`. Exported.
+- `miop_ep_unmap_outbound_atu()` — find the slot by target, hit the viewport
+  reg (+0x900/+0x908) and clear the alloc bit. Exported.
+
+All of the above are transcribed faithfully from `pcie.S` via explicit offset
+arithmetic and are **exported but not yet called** by the probe stub, so the
+module still loads without touching hardware (verified: banners present, no
+oops). Translating `pcie.S`'s loop artifacts (the `readl`/`readw` self-loops)
+into plain `readl`/`readw` is intended.
 
 ### pcie-ep-rk35.ko — stubbed / TODO (the probe)
 `miop_pcie_ep_init()` (factory `pcie.S` ~line 2260, ~880 lines of asm) is
@@ -61,6 +76,8 @@ Helper functions already present in `pcie.S` to translate:
 - `net.c` thin: verified loads/registers, `eth0` created, no oops.
 - `pcie.c` thin: verified loads/registers, no oops (full power cycle).
   Discovered the `miop_ep_machine_id` import dependency (factory net).
+- `pcie.c` ATU/region helpers transcribed (unwired): verified direct node2
+  reboot, banners present, no oops/BUG.
 
 ## Next increments
 1. Implement `miop_pcie_ep_init()` phases in order, testing after each

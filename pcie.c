@@ -20,6 +20,10 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/device.h>
+#include <linux/io.h>
+#include <linux/slab.h>
+#include <linux/bitops.h>
+#include <linux/delay.h>
 
 #include "miop.h"
 
@@ -118,6 +122,160 @@ u32 miop_ep_machine_id(struct miop_ep *ep)
 	return *(u32 *)((char *)p2 + 4);
 }
 EXPORT_SYMBOL(miop_ep_machine_id);
+
+/*
+ * Outbound iATU / window-map helpers — translated from pcie.S.
+ *
+ * The pcie driver keeps a private object (call it `ep`) whose layout, read
+ * straight from the factory disassembly, is:
+ *   ep+0x00  -> sub-struct `hw` (holds n_free @0x68, n_win @0x72)
+ *   ep+0x08  -> reg block base (ATU "viewport" registers at +0x900/+0x908)
+ *   ep+0x20  -> ATU window register base (each window is 0x200 bytes)
+ *   ep+0x30  -> struct device *dev
+ *   ep+0x38  -> bitmap map1  (kcalloc, (n_free+63)/64 u64s)
+ *   ep+0x40  -> bitmap map2  (outbound alloc bitmap, n_win bits)
+ *   ep+0x48  -> u64 addrs[]  (kcalloc, n_win entries; stores mapped target low)
+ *
+ * These are transcribed faithfully from the asm and are NOT yet called by the
+ * probe stub, so loading the module remains safe (no hardware is touched).
+ */
+
+/* kmalloc_array.constprop.0 in pcie.S allocates (n*8) bytes (size inlined to 8). */
+static void *miop_kcalloc_arr(unsigned long n)
+{
+	return kcalloc(n ? n : 1, 8, GFP_KERNEL);
+}
+
+/* rk35_pcie_readl_dbi / _readw_dbi: the vendor's DBI accessor (the asm has a
+ * decompiler-introduced self-loop artifact; the real op is just the read). */
+u32 rk35_pcie_readl_dbi(void *dbi, u32 off)
+{
+	return readl((char *)dbi + off);
+}
+
+u16 rk35_pcie_readw_dbi(void *dbi, u32 off)
+{
+	return readw((char *)dbi + off);
+}
+EXPORT_SYMBOL(rk35_pcie_readl_dbi);
+EXPORT_SYMBOL(rk35_pcie_readw_dbi);
+
+int rk35_pcie_ep_window_map_init(void *ep)
+{
+	void *hw = *(void **)ep;
+	unsigned long n_free = *(u32 *)((char *)hw + 0x68);
+	unsigned long n_win  = *(u32 *)((char *)hw + 0x72);
+	void *b;
+
+	b = miop_kcalloc_arr((n_free + 0x3f) >> 6);
+	if (!b)
+		return -ENOMEM;
+	*(void **)((char *)ep + 0x38) = b;
+
+	b = miop_kcalloc_arr((n_win + 0x3f) >> 6);
+	if (!b)
+		return -ENOMEM;
+	*(void **)((char *)ep + 0x40) = b;
+
+	b = miop_kcalloc_arr(n_win);
+	if (!b)
+		return -ENOMEM;
+	*(void **)((char *)ep + 0x48) = b;
+
+	return 0;
+}
+EXPORT_SYMBOL(rk35_pcie_ep_window_map_init);
+
+void rk35_pcie_ep_window_map_deinit(void *ep)
+{
+	void **p;
+
+	p = (void **)((char *)ep + 0x38);
+	if (*p) { kfree(*p); *p = NULL; }
+
+	p = (void **)((char *)ep + 0x40);
+	if (*p) { kfree(*p); *p = NULL; }
+
+	p = (void **)((char *)ep + 0x48);
+	if (*p) { kfree(*p); *p = NULL; }
+}
+EXPORT_SYMBOL(rk35_pcie_ep_window_map_deinit);
+
+/* Find the outbound slot whose stored target == @addr and tear it down. */
+int miop_ep_unmap_outbound_atu(void *ep, u64 addr)
+{
+	void *hw = *(void **)ep;
+	unsigned long n_win = *(u32 *)((char *)hw + 0x72);
+	u64 *addrs = *(u64 **)((char *)ep + 0x48);
+	void *reg = *(void **)((char *)ep + 0x08);
+	unsigned long bit;
+
+	for (bit = 0; bit < n_win; bit++)
+		if (addrs[bit] == addr)
+			break;
+	if (bit >= n_win)
+		return 0;
+
+	writel(bit, (char *)reg + 0x900);
+	writel(0x7fffffff, (char *)reg + 0x908);
+
+	clear_bit(bit, *(unsigned long **)((char *)ep + 0x40));
+	return 0;
+}
+EXPORT_SYMBOL(miop_ep_unmap_outbound_atu);
+
+/*
+ * miop_ep_map_outbound_atu(ep, target, size, extra) - program one outbound
+ * iATU window. `target` is the low 32 bits of the peer target address, `size`
+ * the window size, `extra` an added offset folded into the limit register.
+ * Returns 0 on success, -EINVAL if no free window.
+ */
+int miop_ep_map_outbound_atu(void *ep, u32 target, u32 size, u32 extra)
+{
+	void *hw = *(void **)ep;
+	unsigned long n_win = *(u32 *)((char *)hw + 0x72);
+	unsigned long *bitmap = *(unsigned long **)((char *)ep + 0x40);
+	u64 *addrs = *(u64 **)((char *)ep + 0x48);
+	void *atu = *(void **)((char *)ep + 0x20);
+	struct device *dev = *(struct device **)((char *)ep + 0x30);
+	unsigned long bit;
+	void *win;
+	int tries = 5;
+
+	bit = find_first_zero_bit(bitmap, n_win);
+	if (bit >= n_win) {
+		dev_err(dev, "outbound free_win exhausted\n");
+		return -EINVAL;
+	}
+
+	win = (char *)atu + (bit << 9);
+	writel(target, (char *)win + 0x8);
+	writel(0, (char *)win + 0xc);
+	writel(target - 1 + extra, (char *)win + 0x10);
+	writel(size, (char *)win + 0x14);
+	writel(0, (char *)win + 0x18);
+	writel(0, (char *)win + 0x0);
+	writel(0x80000000, (char *)win + 0x4);
+
+	while (tries--) {
+		int i;
+		for (i = 0; i < 9; i++) {
+			if (readl((char *)win + 0x4) & (1u << 31))
+				goto enabled;
+			udelay(250);
+		}
+	}
+
+	dev_err(dev, "outbound ATU enable timeout (win %lu)\n", bit);
+enabled:
+	dev_err(dev, "outbound free_win %lu target %#x size %#x\n",
+		bit, target, size);
+
+	set_bit(bit, bitmap);
+	addrs[bit] = target;
+	return 0;
+}
+EXPORT_SYMBOL(miop_ep_map_outbound_atu);
 
 static struct miop_pcie_ep_driver miop_pcie_driver = {
 	.probe = miop_pcie_ep_probe,
