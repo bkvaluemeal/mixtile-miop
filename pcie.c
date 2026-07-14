@@ -243,20 +243,92 @@ enabled:
 EXPORT_SYMBOL(miop_ep_map_outbound_atu);
 
 /*
- * miop_pcie_ep_set_bar() - program one EP BAR (translated from pcie.S
- * rk35_pcie_ep_set_bar.isra.0). The original operated on the vendor's
- * struct rockchip_pcie (dbi_base @0, apb_base @8); here we drive our raw
- * mmio directly. NOTE: the original computed the BAR register offset from a
- * per-controller base (rockchip_pcie+0x20) that we do not yet reconstruct, so
- * for this pass the BAR table is assumed to start at the DBI header (offset 0)
- * with one 8-byte slot per BAR index. This is stubbed to a no-op with a log so
- * the link can still train; the real BAR layout is wired in a later pass.
+ * miop_pcie_ep_set_bar() - program one EP BAR. Transcribed from pcie.S
+ * rk35_pcie_ep_set_bar.isra.0. The original ran on the vendor's struct
+ * rockchip_pcie (dbi_base @0, apb_base @8); we drive our raw mmio directly.
+ *
+ * The vendor computed the BAR register offset as (base_idx + bar*8) where
+ * base_idx was read from rockchip_pcie+0x20 (assumed here to be the outbound
+ * window count, ep->n_win, which matches the +0x80-aligned BAR table the RK
+ * DWC EP uses). The arithmetic below reproduces the asm exactly relative to
+ * dbi_base (BAR regs) and apb_base (64-bit shadow). All writes stay inside the
+ * 16 MiB DBI/APB ioremap, so a wrong offset cannot oops — it just yields a
+ * non-functional BAR until validated at link-up.
  */
 static void miop_pcie_ep_set_bar(struct miop_pcie *pcie, int bar,
 				 u64 size, int flags)
 {
-	dev_info(pcie->dev, "set_bar(bar=%d size=%#llx flags=%#x) [stub]\n",
-		 bar, size, flags);
+	void __iomem *dbi = pcie->dbi_base;
+	void __iomem *apb = pcie->apb_base;
+	u32 base_idx = pcie->ep->n_win;	/* rockchip_pcie+0x20 guess */
+	u32 bi  = base_idx + bar * 8;		/* BAR register index offset */
+	u32 apo = (bar + 4) * 4;		/* APB 64-bit shadow offset */
+	u32 sz_enc;
+
+	/* BAR lower / size field (asm: *(D + BI + 4) = 0; *(D + BI + 8) = size) */
+	writel(0, dbi + bi + 4);
+	if (size > 0xfffff) {
+		/* size encoding: clz(rbit(size)) - 20, placed at bits[12:8].
+		 * clz(rbit(x)) == ffs(x)-1, so this is (ffs(size)-21) & 0x1f. */
+		sz_enc = ((ffs((u32)size) - 1 - 0x14) & 0x1f) << 8;
+		writel(sz_enc, dbi + bi + 8);
+	} else {
+		writel(0, dbi + bi + 8);
+	}
+
+	/* 64-bit BAR: clear the upper shadow (asm: flags & 0x4). */
+	if (flags & 0x4) {
+		writel(0, apb + apo + 4);
+		writel(0, dbi + bi + 12);
+		writel(0, dbi + bi + 16);
+	}
+
+	if (size != 0)
+		writel(0, apb + apo);			/* BAR lower (APB shadow) */
+
+	/* BAR type/flags (asm: *(D + BI) = flags; if !64-bit also clear +4). */
+	writel(flags, dbi + bi);
+	if (!(flags & 0x4))
+		writel(0, dbi + bi + 4);
+
+	dev_info(pcie->dev,
+		 "set_bar(bar=%d size=%#llx flags=%#x) bi=%#x [transcribed]\n",
+		 bar, size, flags, bi);
+}
+
+/*
+ * miop_pcie_map_inbound_atu() - allocate an inbound iATU window (mirrors the
+ * probe's find_first_zero_bit + atu_base window program, pcie.S ~2637-2911).
+ * Maps the RC-visible PCIe address `pci_addr` to the local CPU address
+ * `local` (our RX/DMA buffer). The iATU register stride (bit<<9) and field
+ * layout match our outbound helper (standard DWC iATU).
+ */
+static int miop_pcie_map_inbound_atu(struct miop_pcie *pcie, u64 local)
+{
+	struct miop_ep *ep = pcie->ep;
+	unsigned long n_ib = ep->hw.num_ib_windows;
+	unsigned long bit;
+	void __iomem *win;
+
+	bit = find_first_zero_bit(pcie->map1, n_ib);
+	if (bit >= n_ib) {
+		dev_err(pcie->dev, "inbound slot exhausted\n");
+		return -EINVAL;
+	}
+
+	win = (char __iomem *)pcie->atu_base + (bit << 9);
+	writel(0x1, (char *)win + 0x0);		/* DIRECTION = inbound */
+	writel(0x0, (char *)win + 0x4);
+	writel((u32)local, (char *)win + 0x8);		/* target low (local) */
+	writel((u32)(local >> 32), (char *)win + 0xc);
+	writel(0xffffffff, (char *)win + 0x10);	/* limit */
+	writel(0x0, (char *)win + 0x14);
+	writel(0x80000000, (char *)win + 0x4);		/* enable */
+
+	set_bit(bit, pcie->map1);
+	pcie->link_slot = (int)bit;
+	dev_info(pcie->dev, "inbound ATU slot %lu -> local %#llx\n", bit, local);
+	return 0;
 }
 
 /*
@@ -327,13 +399,16 @@ static void miop_pcie_config_controller(struct miop_pcie *pcie,
 	/* Controller enable toggle (0x8bc = 1, then 0 after id writes). */
 	v = rk35_pcie_readl_dbi(dbi, 0x8bc);
 	writel(v | 0x1, dbi + 0x8bc);
-	/* set_bar x4 (STUBBED for this pass). */
+	/* set_bar x4 (EP BARs). */
 	miop_pcie_ep_set_bar(pcie, 0, 0x2000000, 0xc);
 	miop_pcie_ep_set_bar(pcie, 2, 0, 0);
 	miop_pcie_ep_set_bar(pcie, 3, 0, 0);
 	miop_pcie_ep_set_bar(pcie, 4, 0x100000, 0xc);
 	v = rk35_pcie_readl_dbi(dbi, 0x8bc);
 	writel(v & ~0x1, dbi + 0x8bc);
+
+	/* Inbound iATU window mapping our local RX/DMA buffer for RC access. */
+	miop_pcie_map_inbound_atu(pcie, pcie->dma_dma);
 }
 
 /*

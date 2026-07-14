@@ -59,12 +59,16 @@ verifiable increment):
    controller-config block transcribed: APB glue, RK APP 0x380054/0xa8 clears,
    DBI 0x710 link-cap width, 0x80c link speed, 0x4, 0x0/0x2/0xc EP identity,
    0x8bc enable toggle).
-6. `rk35_pcie_ep_set_bar` ×4 — configure EP BARs. **STUBBED** (logs, no-op).
-   The original computed the BAR register offset from a per-controller base
-   (`rockchip_pcie+0x20`, assumed `num_ob_windows*8` = 0x80); to be wired
-   next pass against our raw `dbi_base`.
+6. `rk35_pcie_ep_set_bar` ×4 — configure EP BARs. **WIRED** (transcribed from
+   `rk35_pcie_ep_set_bar.isra.0`). Uses `base_idx = ep->n_win` (16) so the BAR
+   table sits at `dbi + 0x10 + bar*8`; faithful offset arithmetic preserved
+   against `pcie->dbi_base`/`pcie->apb_base`. Load-tested: no oops (writes stay
+   inside the 16 MiB DBI/APB ioremap); functional correctness only visible at
+   link-up.
 7. `find_first_zero_bit` — allocate per-peer/ring inbound slot + program the
-   inbound iATU window (`atu_base + bit<<9`). **STUBBED** (skipped this pass).
+   inbound iATU window. **WIRED** (`miop_pcie_map_inbound_atu`): allocates a slot
+   from `pcie->map1` (bounded by `num_ib_windows`), maps it inbound to
+   `pcie->dma_dma` (the reserved 4 MiB region). Verified slot 0 → 0xe000000.
 8. `ioremap` — map peer BAR / RC staging regions. **STUBBED**.
 9. `dma_alloc_attrs` ×2 — more DMA regions (peer-desc rings). **STUBBED**.
 10. `devm_request_threaded_irq` — `rk35_ep_interrupt` handler. **WIRED** with a
@@ -121,8 +125,10 @@ Helper functions already present in `pcie.S` to translate:
   Probe runs the full new path; link-training polls `apb+0x300` and times out
   gracefully (~5 s, bounded) because the peer/switch wasn't reset (node2-only
   reboot; node3 RC *was* up but switch↔node2 link can't retrain without a full
-  power cycle). Serial `0x58c184bf` reported. Next: a full cluster power cycle
-  is needed to confirm the link actually trains with this config.
+  power cycle). Serial `0x58c184bf` reported. `set_bar` (transcribed, bi@0x10/
+  0x20/0x28/0x30) and inbound ATU (slot 0 → 0xe000000) also load clean.
+  Next: a full cluster power cycle is needed to confirm the link actually
+  trains + the EP function is visible with this config.
 
 ## Next increments
 1. Implement `miop_pcie_ep_init()` phases in order, testing after each
