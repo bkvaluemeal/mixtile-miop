@@ -135,6 +135,8 @@ struct miop_pcie {
 	u64 peer_bar_phys;
 	void __iomem *peer_db_base[4];
 	u64 peer_db_off[4];
+	void __iomem *peer_data_base[4];
+	dma_addr_t peer_data_dma[4];
 	int link_slot;
 	u32 serial;
 	int link_up;

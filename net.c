@@ -61,13 +61,14 @@ static int miop_ndo_stop(struct net_device *dev)
 
 static void miop_tx_complete(u64 cookie, u64 status)
 {
+	/* The TX skb is freed once by miop_rk35_dma_submit after all peer
+	 * copies complete (broadcast path); only bump stats here. */
 	struct sk_buff *skb = (struct sk_buff *)(unsigned long)cookie;
 
 	if (skb) {
 		struct net_device *ndev = skb->dev;
 		if (ndev)
 			ndev->stats.tx_packets++;
-		dev_kfree_skb_any(skb);
 	}
 }
 
@@ -92,7 +93,7 @@ static netdev_tx_t miop_ndo_start_xmit(struct sk_buff *skb,
 		return NETDEV_TX_OK;
 	}
 
-	ret = pdrv->dma_submit(pdev, 0, dma, 0, skb->len,
+	ret = pdrv->dma_submit(pdev, -1, dma, 0, skb->len,
 			       (u64)(unsigned long)skb, miop_tx_complete);
 	if (ret) {
 		dma_unmap_single(pdev, dma, skb->len, DMA_TO_DEVICE);
