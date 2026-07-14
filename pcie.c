@@ -219,6 +219,7 @@ int miop_ep_map_outbound_atu(struct miop_pcie *pcie, u64 target, u32 size, u32 e
 	int tries = 5;
 	u32 t_lo = (u32)(target & 0xffffffff);
 	u32 t_hi = (u32)(target >> 32);
+	u64 limit = target + size - 1 + extra;
 
 	bit = find_first_zero_bit(pcie->map2, n_win);
 	if (bit >= n_win) {
@@ -227,24 +228,23 @@ int miop_ep_map_outbound_atu(struct miop_pcie *pcie, u64 target, u32 size, u32 e
 	}
 
 	win = (char *)pcie->atu_base + (bit << 9);
-	/* Identity outbound map: source (local CPU) address == target (fabric)
-	 * address, so a CPU write into the ioremapped window is translated onto
-	 * the fabric at `target`.  Both the 64-bit source base and the 64-bit
-	 * target must be programmed (low 32 at +0x0/+0x8, high 32 at +0x4/+0xc)
-	 * or a 64-bit target such as 0x901000000 gets truncated. */
-	writel(t_lo, (char *)win + 0x0);          /* source / base lower */
-	writel(t_hi, (char *)win + 0x4);          /* source / base upper */
+	/* Register layout transcribed from the factory miop_ep_map_outbound_atu
+	 * (pcie_asm.S:1116-1162): target at +0x8/+0xc, limit at +0x10/+0x20,
+	 * size at +0x14/+0x18, control(enable) at +0x4.  The source/base (+0x0)
+	 * is left 0; the factory relies on target+limit+size alone. */
 	writel(t_lo, (char *)win + 0x8);          /* target lower */
 	writel(t_hi, (char *)win + 0xc);          /* target upper */
-	writel((u32)((target - 1 + extra) & 0xffffffff), (char *)win + 0x10);
-	writel((u32)((target - 1 + extra) >> 32), (char *)win + 0x14);
-	writel(size, (char *)win + 0x18);
-	writel(0x80000000, (char *)win + 0x1c);
+	writel((u32)(limit & 0xffffffff), (char *)win + 0x10);   /* limit lower */
+	writel((u32)(limit >> 32),       (char *)win + 0x20);   /* limit upper */
+	writel(size,  (char *)win + 0x14);        /* size lower */
+	writel(0,     (char *)win + 0x18);        /* size upper */
+	writel(0,     (char *)win + 0x0);         /* source/base */
+	writel(0x80000000, (char *)win + 0x4);    /* enable */
 
 	while (tries--) {
 		int i;
 		for (i = 0; i < 9; i++) {
-			if (readl((char *)win + 0x1c) & (1u << 31))
+			if (readl((char *)win + 0x4) & (1u << 31))
 				goto enabled;
 			udelay(250);
 		}
