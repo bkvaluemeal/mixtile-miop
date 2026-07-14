@@ -204,8 +204,10 @@ EXPORT_SYMBOL(miop_ep_unmap_outbound_atu);
 
 /*
  * miop_ep_map_outbound_atu(pcie, target, size, extra) - program one outbound
- * iATU window. `target` is the low 32 bits of the peer target address, `size`
- * the window size, `extra` an added offset folded into the limit register.
+ * iATU window. The factory's miop_rk35_map_peer_bar passes phys as `target`
+ * and expects a 1:1 map (local CPU physical == PCIe target), so a write to
+ * ioremap(target) is translated by the iATU onto the fabric at `target`.
+ * `size` is the window size, `extra` an added offset folded into the limit.
  * Returns 0 on success, -EINVAL if no free window.
  */
 int miop_ep_map_outbound_atu(struct miop_pcie *pcie, u32 target, u32 size, u32 extra)
@@ -223,12 +225,18 @@ int miop_ep_map_outbound_atu(struct miop_pcie *pcie, u32 target, u32 size, u32 e
 	}
 
 	win = (char *)pcie->atu_base + (bit << 9);
+	/* The factory's sequence wrote 0 to win+0x0 (the outbound window's SOURCE
+	 * / base address register). Without a defined source, a CPU write to the
+	 * mapped address is never translated onto the fabric. The factory passes
+	 * phys as the target and uses an identity map (source == target), so write
+	 * the source base here. The remaining target/limit/size/enable writes are
+	 * kept from the factory sequence. */
+	writel(target, (char *)win + 0x0);          /* source / base lower */
 	writel(target, (char *)win + 0x8);
 	writel(0, (char *)win + 0xc);
 	writel(target - 1 + extra, (char *)win + 0x10);
 	writel(size, (char *)win + 0x14);
 	writel(0, (char *)win + 0x18);
-	writel(0, (char *)win + 0x0);
 	writel(0x80000000, (char *)win + 0x4);
 
 	while (tries--) {
