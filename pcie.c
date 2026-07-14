@@ -1069,7 +1069,8 @@ static int miop_pcie_ep_probe(struct device *dev)
 		writel(0x40000308, pcie->dbi_base + 0x380200);
 		writel(0,          pcie->dbi_base + 0x380204);
 		writel((u32)pcie->chan[0].ring_dma, pcie->dbi_base + 0x38021C);
-		writel(0x180,      pcie->dbi_base + 0x380220);
+		writel((u32)(pcie->chan[0].ring_dma >> 32),
+		       pcie->dbi_base + 0x380220);
 		dmb(oshst);
 
 		writel(0x10001, pcie->dbi_base + 0x380058);
