@@ -324,6 +324,11 @@ static int miop_ep_probe(struct platform_device *pdev)
 
 	ep->pdev = pdev;
 
+	/* Let the pcie-ep-rk35.ko probe recover the ep context via the standard
+	 * driver-data slot (also stash it at pdev+0x88 to mirror the binary). */
+	platform_set_drvdata(pdev, ep);
+	*(void **)((char *)pdev + 0x88) = ep;
+
 	/* Pull the two lower-layer driver structs out of the registry. */
 	ep->pcie_ep_drv = miop_register_pcie_ep_drv(NULL);
 	ep->net_drv = miop_register_ep_net_drv(NULL);
@@ -346,6 +351,11 @@ static int miop_ep_probe(struct platform_device *pdev)
 	ret = miop_pcie_ep_resource_setup(pdev, hw);
 	if (ret)
 		goto err_net;
+
+	/* The pcie-ep-rk35.ko probe sizes its outbound-window bitmaps from these
+	 * counts; mirror the binary and feed it the EP's outbound window count. */
+	ep->n_free = hw->num_ob_windows;
+	ep->n_win = hw->num_ob_windows;
 
 	/* Optional 3.3V PCIe supply. */
 	hw->regulator = devm_regulator_get_optional(dev, "vpcie3v3");

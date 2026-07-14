@@ -25,6 +25,11 @@
  * struct miop_ep in their parameter lists without a local forward decl. */
 struct miop_ep;
 
+/* Forward declaration of the pcie private struct (defined fully below). The
+ * pcie-ep-rk35.ko probe allocates one of these and hangs it off struct miop_ep
+ * so the ATU / region helpers and the net layer can reach it. */
+struct miop_pcie;
+
 /* Driver structs published into the miop-reg registry. Only the function
  * pointers exercised by miop-ep.ko are typed here; the remaining slots are
  * filled in by pcie-ep-rk35.ko / miop-ep-net.ko and used internally. */
@@ -97,12 +102,34 @@ struct miop_ep_hw {
 	void *net_priv;				/* +0x138 (ep+0x150) back-link to net priv */
 };
 
-/* struct miop_ep - per-blade endpoint context (exactly 0x158 bytes). */
+/* struct miop_pcie - the pcie-ep-rk35.ko private context, allocated in
+ * miop_pcie_ep_probe() and referenced by the ATU / window-map helpers. Field
+ * semantics are taken from the pcie.S disassembly (dbi/apb/atu bases, the
+ * outbound-window bitmaps, the TX/DMA buffer); the exact byte layout is our
+ * own (the lower layers all agree on these field names). */
+struct miop_pcie {
+	struct miop_ep *ep;		/* back-pointer to the per-blade context */
+	void __iomem *dbi_base;		/* ioremap of the DBI register window */
+	void __iomem *dbi_base2;	/* DBI + 0x100000 (controller block) */
+	void __iomem *apb_base;		/* ioremap of the APB register window */
+	void __iomem *atu_base;		/* DBI + 0x300000 (outbound iATU windows) */
+	struct device *dev;		/* the endpoint struct device */
+	unsigned long *map1;		/* window bitmap #1 (kcalloc) */
+	unsigned long *map2;		/* outbound alloc bitmap (kcalloc) */
+	u64 *addrs;			/* per-window mapped target low (kcalloc) */
+	void *dma_buf;		/* 0x400000 TX/DMA coherent buffer (CPU va) */
+	dma_addr_t dma_dma;		/* 0x400000 TX/DMA buffer bus address */
+};
+
+/* struct miop_ep - per-blade endpoint context. */
 struct miop_ep {
 	struct platform_device *pdev;		/* +0x00 */
 	void *pcie_ep_drv;			/* +0x08 */
 	void *net_drv;				/* +0x10 */
+	u32 n_free;				/* outbound-window free count */
+	u32 n_win;				/* outbound-window total count */
 	struct miop_ep_hw hw;			/* +0x18 */
+	struct miop_pcie *pcie_priv;		/* set by pcie-ep-rk35.ko probe */
 };
 
 /* EP-layer API implemented in ep.c and consumed by the lower-layer modules.

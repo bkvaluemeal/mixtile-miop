@@ -24,30 +24,13 @@
 #include <linux/slab.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
+#include <linux/platform_device.h>
+#include <linux/dma-mapping.h>
 
 #include "miop.h"
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Mixtile TCP/IP over PCIe RK35 EP driver (thin C pass)");
-
-/*
- * miop_pcie_ep_probe() - EP controller bring-up, called by miop-ep.ko.
- * @dev: the endpoint struct device (pdev+0x10, as passed by miop-ep.ko).
- *
- * The original binary, here, initialised the RK3588 PCIe EP controller,
- * trained the link to the peer blade, programmed the outbound iATU windows
- * (the "outbound free_win" messages), set up MSI/legacy IRQs, started the
- * peer handshake and flipped the net carrier once the peer came online.
- *
- * Thin pass: do none of that. Return success so miop-ep.ko's probe() can
- * complete; the link simply will not come up until the real logic lands.
- *
- * Return: 0.
- */
-static int miop_pcie_ep_probe(struct device *dev)
-{
-	return 0;
-}
 
 /*
  * miop_ep_generate_serial() / miop_ep_machine_id() - serial & MAC id.
@@ -126,18 +109,10 @@ EXPORT_SYMBOL(miop_ep_machine_id);
 /*
  * Outbound iATU / window-map helpers — translated from pcie.S.
  *
- * The pcie driver keeps a private object (call it `ep`) whose layout, read
- * straight from the factory disassembly, is:
- *   ep+0x00  -> sub-struct `hw` (holds n_free @0x68, n_win @0x72)
- *   ep+0x08  -> reg block base (ATU "viewport" registers at +0x900/+0x908)
- *   ep+0x20  -> ATU window register base (each window is 0x200 bytes)
- *   ep+0x30  -> struct device *dev
- *   ep+0x38  -> bitmap map1  (kcalloc, (n_free+63)/64 u64s)
- *   ep+0x40  -> bitmap map2  (outbound alloc bitmap, n_win bits)
- *   ep+0x48  -> u64 addrs[]  (kcalloc, n_win entries; stores mapped target low)
- *
- * These are transcribed faithfully from the asm and are NOT yet called by the
- * probe stub, so loading the module remains safe (no hardware is touched).
+ * These operate on struct miop_pcie (see miop.h). The asm used absolute
+ * offsets into the pcie private; here they are mapped to named fields. The
+ * helpers are exported because miop-ep-net.ko's data path calls them once the
+ * link is up.
  */
 
 /* kmalloc_array.constprop.0 in pcie.S allocates (n*8) bytes (size inlined to 8). */
@@ -160,54 +135,46 @@ u16 rk35_pcie_readw_dbi(void *dbi, u32 off)
 EXPORT_SYMBOL(rk35_pcie_readl_dbi);
 EXPORT_SYMBOL(rk35_pcie_readw_dbi);
 
-int rk35_pcie_ep_window_map_init(void *ep)
+int rk35_pcie_ep_window_map_init(struct miop_pcie *pcie)
 {
-	void *hw = *(void **)ep;
-	unsigned long n_free = *(u32 *)((char *)hw + 0x68);
-	unsigned long n_win  = *(u32 *)((char *)hw + 0x72);
+	struct miop_ep *ep = pcie->ep;
+	unsigned long n_free = ep->n_free;
+	unsigned long n_win  = ep->n_win;
 	void *b;
 
 	b = miop_kcalloc_arr((n_free + 0x3f) >> 6);
 	if (!b)
 		return -ENOMEM;
-	*(void **)((char *)ep + 0x38) = b;
+	pcie->map1 = b;
 
 	b = miop_kcalloc_arr((n_win + 0x3f) >> 6);
 	if (!b)
 		return -ENOMEM;
-	*(void **)((char *)ep + 0x40) = b;
+	pcie->map2 = b;
 
 	b = miop_kcalloc_arr(n_win);
 	if (!b)
 		return -ENOMEM;
-	*(void **)((char *)ep + 0x48) = b;
+	pcie->addrs = b;
 
 	return 0;
 }
 EXPORT_SYMBOL(rk35_pcie_ep_window_map_init);
 
-void rk35_pcie_ep_window_map_deinit(void *ep)
+void rk35_pcie_ep_window_map_deinit(struct miop_pcie *pcie)
 {
-	void **p;
-
-	p = (void **)((char *)ep + 0x38);
-	if (*p) { kfree(*p); *p = NULL; }
-
-	p = (void **)((char *)ep + 0x40);
-	if (*p) { kfree(*p); *p = NULL; }
-
-	p = (void **)((char *)ep + 0x48);
-	if (*p) { kfree(*p); *p = NULL; }
+	kfree(pcie->map1); pcie->map1 = NULL;
+	kfree(pcie->map2); pcie->map2 = NULL;
+	kfree(pcie->addrs); pcie->addrs = NULL;
 }
 EXPORT_SYMBOL(rk35_pcie_ep_window_map_deinit);
 
 /* Find the outbound slot whose stored target == @addr and tear it down. */
-int miop_ep_unmap_outbound_atu(void *ep, u64 addr)
+int miop_ep_unmap_outbound_atu(struct miop_pcie *pcie, u64 addr)
 {
-	void *hw = *(void **)ep;
-	unsigned long n_win = *(u32 *)((char *)hw + 0x72);
-	u64 *addrs = *(u64 **)((char *)ep + 0x48);
-	void *reg = *(void **)((char *)ep + 0x08);
+	struct miop_ep *ep = pcie->ep;
+	unsigned long n_win = ep->n_win;
+	u64 *addrs = pcie->addrs;
 	unsigned long bit;
 
 	for (bit = 0; bit < n_win; bit++)
@@ -216,39 +183,35 @@ int miop_ep_unmap_outbound_atu(void *ep, u64 addr)
 	if (bit >= n_win)
 		return 0;
 
-	writel(bit, (char *)reg + 0x900);
-	writel(0x7fffffff, (char *)reg + 0x908);
+	writel(bit, (char *)pcie->dbi_base + 0x900);
+	writel(0x7fffffff, (char *)pcie->dbi_base + 0x908);
 
-	clear_bit(bit, *(unsigned long **)((char *)ep + 0x40));
+	clear_bit(bit, pcie->map2);
 	return 0;
 }
 EXPORT_SYMBOL(miop_ep_unmap_outbound_atu);
 
 /*
- * miop_ep_map_outbound_atu(ep, target, size, extra) - program one outbound
+ * miop_ep_map_outbound_atu(pcie, target, size, extra) - program one outbound
  * iATU window. `target` is the low 32 bits of the peer target address, `size`
  * the window size, `extra` an added offset folded into the limit register.
  * Returns 0 on success, -EINVAL if no free window.
  */
-int miop_ep_map_outbound_atu(void *ep, u32 target, u32 size, u32 extra)
+int miop_ep_map_outbound_atu(struct miop_pcie *pcie, u32 target, u32 size, u32 extra)
 {
-	void *hw = *(void **)ep;
-	unsigned long n_win = *(u32 *)((char *)hw + 0x72);
-	unsigned long *bitmap = *(unsigned long **)((char *)ep + 0x40);
-	u64 *addrs = *(u64 **)((char *)ep + 0x48);
-	void *atu = *(void **)((char *)ep + 0x20);
-	struct device *dev = *(struct device **)((char *)ep + 0x30);
+	struct miop_ep *ep = pcie->ep;
+	unsigned long n_win = ep->n_win;
 	unsigned long bit;
 	void *win;
 	int tries = 5;
 
-	bit = find_first_zero_bit(bitmap, n_win);
+	bit = find_first_zero_bit(pcie->map2, n_win);
 	if (bit >= n_win) {
-		dev_err(dev, "outbound free_win exhausted\n");
+		dev_err(pcie->dev, "outbound free_win exhausted\n");
 		return -EINVAL;
 	}
 
-	win = (char *)atu + (bit << 9);
+	win = (char *)pcie->atu_base + (bit << 9);
 	writel(target, (char *)win + 0x8);
 	writel(0, (char *)win + 0xc);
 	writel(target - 1 + extra, (char *)win + 0x10);
@@ -266,16 +229,84 @@ int miop_ep_map_outbound_atu(void *ep, u32 target, u32 size, u32 extra)
 		}
 	}
 
-	dev_err(dev, "outbound ATU enable timeout (win %lu)\n", bit);
+	dev_err(pcie->dev, "outbound ATU enable timeout (win %lu)\n", bit);
 enabled:
-	dev_err(dev, "outbound free_win %lu target %#x size %#x\n",
+	dev_err(pcie->dev, "outbound free_win %lu target %#x size %#x\n",
 		bit, target, size);
 
-	set_bit(bit, bitmap);
-	addrs[bit] = target;
+	set_bit(bit, pcie->map2);
+	pcie->addrs[bit] = target;
 	return 0;
 }
 EXPORT_SYMBOL(miop_ep_map_outbound_atu);
+
+/*
+ * miop_pcie_ep_probe() - RK35 EP bring-up, called by miop-ep.ko.
+ *
+ * Early/structural bring-up transcribed from pcie.S miop_pcie_ep_init:
+ * allocate the pcie private, ioremap the DBI/APB windows, allocate the
+ * outbound-window bitmaps from the EP window counts, and carve out the TX/DMA
+ * coherent buffer. Link training, BAR setup, the outbound ATU mappings, IRQ
+ * wiring and the peer handshake (which calls net_drv->on_peer_online) are
+ * still to be wired in later passes; returning success here keeps the module
+ * loadable so this structural setup can be verified without touching the link.
+ */
+static int miop_pcie_ep_probe(struct device *dev)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct miop_ep *ep = platform_get_drvdata(pdev);
+	struct miop_pcie *pcie;
+	void __iomem *dbi_base, *apb_base;
+	dma_addr_t dma_dma;
+	void *dma_buf;
+
+	if (!ep) {
+		dev_err(dev, "miop_pcie_ep_probe: no ep context\n");
+		return -ENODEV;
+	}
+
+	pcie = devm_kzalloc(dev, sizeof(*pcie), GFP_KERNEL);
+	if (!pcie)
+		return -ENOMEM;
+	pcie->ep = ep;
+	pcie->dev = dev;
+	ep->pcie_priv = pcie;
+
+	dbi_base = devm_ioremap_resource(dev, ep->hw.res_dbi);
+	if (IS_ERR(dbi_base)) {
+		dev_err(dev, "ioremap DBI failed\n");
+		return PTR_ERR(dbi_base);
+	}
+	pcie->dbi_base = dbi_base;
+	pcie->dbi_base2 = (char __iomem *)dbi_base + 0x100000;
+	pcie->atu_base = (char __iomem *)dbi_base + 0x300000;
+
+	apb_base = devm_ioremap_resource(dev, ep->hw.res_apb);
+	if (IS_ERR(apb_base)) {
+		dev_err(dev, "ioremap APB failed\n");
+		return PTR_ERR(apb_base);
+	}
+	pcie->apb_base = apb_base;
+
+	if (rk35_pcie_ep_window_map_init(pcie)) {
+		dev_err(dev, "window map init failed\n");
+		return -ENOMEM;
+	}
+
+	dma_buf = dmam_alloc_coherent(dev, 0x400000, &dma_dma, GFP_KERNEL);
+	if (!dma_buf) {
+		dev_err(dev, "tx/dma buffer alloc failed\n");
+		rk35_pcie_ep_window_map_deinit(pcie);
+		return -ENOMEM;
+	}
+	pcie->dma_buf = dma_buf;
+	pcie->dma_dma = dma_dma;
+
+	dev_info(dev, "Mixtile RK35 EP probe: n_free=%u n_win=%u\n",
+		 ep->n_free, ep->n_win);
+
+	return 0;
+}
 
 static struct miop_pcie_ep_driver miop_pcie_driver = {
 	.probe = miop_pcie_ep_probe,
