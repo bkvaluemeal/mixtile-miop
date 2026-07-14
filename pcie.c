@@ -1016,32 +1016,9 @@ static int miop_pcie_ep_probe(struct device *dev)
 		 ep->n_free, ep->n_win, pcie->serial,
 		 pcie->link_up ? "up" : "down");
 
-	/* DMA self-test: write descriptor to ring and doorbell */
+	/* DMA self-test: match old working test exactly */
 	{
 		struct miop_dma_desc *d = pcie->chan[0].ring;
-		int tries;
-		u32 v;
-
-		/* Dump key DMA registers */
-		dev_info(dev, "DMA regs: 0x000=0x%08x 0x00C=0x%08x 0x010=0x%08x "
-			 "0x02C=0x%08x 0x04C=0x%08x 0x050=0x%08x 0x054=0x%08x "
-			 "0x058=0x%08x 0x090=0x%08x 0x0A8=0x%08x 0x0C4=0x%08x\n",
-			 readl(pcie->dbi_base + 0x380000),
-			 readl(pcie->dbi_base + 0x38000C),
-			 readl(pcie->dbi_base + 0x380010),
-			 readl(pcie->dbi_base + 0x38002C),
-			 readl(pcie->dbi_base + 0x38004C),
-			 readl(pcie->dbi_base + 0x380050),
-			 rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054),
-			 readl(pcie->dbi_base + 0x380058),
-			 rk35_pcie_readl_dbi(pcie->dbi_base, 0x380090),
-			 rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800A8),
-			 rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800C4));
-
-		dev_info(dev, "DMA regs: 0x200=0x%08x 0x21C=0x%08x 0x220=0x%08x\n",
-			 readl(pcie->dbi_base + 0x380200),
-			 readl(pcie->dbi_base + 0x38021C),
-			 readl(pcie->dbi_base + 0x380220));
 
 		/* Write a descriptor to the ring */
 		memset(d, 0, sizeof(*d));
@@ -1059,24 +1036,18 @@ static int miop_pcie_ep_probe(struct device *dev)
 			 d->addr_high, d->addr_low,
 			 *(u64 *)((char *)d + 16));
 
-		/* Full doorbell sequence per factory */
+		/* Enable DMA, clear pending, enable irq, arm */
 		writel(1, pcie->dbi_base + 0x38000C);
 		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054) & ~1u;
 		writel(v, pcie->dbi_base + 0x380054);
 		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380090) | 0x10000;
 		writel(v, pcie->dbi_base + 0x380090);
-
-		writel(0x40000308, pcie->dbi_base + 0x380200);
-		writel(0,          pcie->dbi_base + 0x380204);
-		writel((u32)pcie->chan[0].ring_dma, pcie->dbi_base + 0x38021C);
-		writel((u32)(pcie->chan[0].ring_dma >> 32),
-		       pcie->dbi_base + 0x380220);
-		dmb(oshst);
-
 		writel(0x10001, pcie->dbi_base + 0x380058);
 		dmb(oshst);
-		wmb();
-		writel(0, pcie->dbi_base + 0x380010);
+
+		/* Doorbell — match factory rk35_dma_start_write exactly */
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
+		writel((v & ~7) | 0, pcie->dbi_base + 0x380010);
 		dmb(oshst);
 
 		dev_info(dev, "Post-doorbell: 0x04C=0x%08x 0x00C=0x%08x "
@@ -1085,20 +1056,21 @@ static int miop_pcie_ep_probe(struct device *dev)
 			 readl(pcie->dbi_base + 0x38000C),
 			 readl(pcie->dbi_base + 0x380058));
 
-		tries = 0;
-		while (tries < 1000) {
-			udelay(100);
-			if (!(d->status & 1))
-				break;
-			tries++;
+		{
+			int tries = 0;
+			while (tries < 500) {
+				udelay(200);
+				if (!(d->status & 1))
+					break;
+				tries++;
+			}
+			dev_info(dev, "Result: tries=%d desc=%u 0x00C=0x%08x "
+				 "0x04C=0x%08x apb[0x10]=0x%08x\n",
+				 tries, d->status,
+				 readl(pcie->dbi_base + 0x38000C),
+				 readl(pcie->dbi_base + 0x38004C),
+				 readl(pcie->apb_base + 0x10));
 		}
-		dev_info(dev, "Result: tries=%d status=%u 0x00C=0x%08x "
-			 "0x04C=0x%08x 0x058=0x%08x apb[0x10]=0x%08x\n",
-			 tries, d->status,
-			 readl(pcie->dbi_base + 0x38000C),
-			 readl(pcie->dbi_base + 0x38004C),
-			 readl(pcie->dbi_base + 0x380058),
-			 readl(pcie->apb_base + 0x10));
 	}
 
 	return 0;
