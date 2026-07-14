@@ -1016,71 +1016,107 @@ static int miop_pcie_ep_probe(struct device *dev)
 		 ep->n_free, ep->n_win, pcie->serial,
 		 pcie->link_up ? "up" : "down");
 
-	/* DMA self-test: minimal direct-mode write to verify engine works */
+	/* DMA self-test: try multiple direct-mode approaches */
 	{
-		int tries;
-		u32 doorbell_sta, doorbell_db, v;
+		u32 tries, db_val;
+		u32 results[10];
 
-		dev_info(dev, "DMA self-test BEGIN (%d channels)\n", MIOP_DMA_NUM_CH);
+		dev_info(dev, "DMA self-test BEGIN\n");
 
+		/* Approach A: direct mode, doorbell=0 */
 		writel(1, pcie->dbi_base + 0x38000C);
 		dmb(oshst);
-		dev_info(dev, "DMA: 0x38000C=0x%08x (1=enabled)\n",
-			 readl(pcie->dbi_base + 0x38000C));
-
-		/* Direct mode: bits [1:0]=10, and bits [3:2] must select write
-		 * engine for ch0.  Clear any pending first. */
 		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
 		writel(v & ~3u, pcie->dbi_base + 0x380054);
 		dmb(oshst);
 
-		/* Program ch0 doorbell config for direct mode */
 		writel(0x40000302, pcie->dbi_base + 0x380200);
 		dmb(oshst);
 		writel(0, pcie->dbi_base + 0x380204);
 		dmb(oshst);
-		dev_info(dev, "DMA: 0x380200=0x%08x (direct mode)\n",
-			 readl(pcie->dbi_base + 0x380200));
-
-		/* Source address (local DDR, must be valid) */
 		writel((u32)pcie->dma_dma, pcie->dbi_base + 0x38020C);
 		dmb(oshst);
-		/* Destination address (PCIe bus address — 0 is valid for the
-		 * RC's memory window, or will get a master abort) */
 		writel(0, pcie->dbi_base + 0x380210);
 		dmb(oshst);
-		/* Transfer size */
 		writel(8, pcie->dbi_base + 0x380214);
 		dmb(oshst);
-
-		dev_info(dev, "DMA: src=0x%08x dst=0x%08x len=8\n",
-			 readl(pcie->dbi_base + 0x38020C),
-			 readl(pcie->dbi_base + 0x380210));
-
-		/* Doorbell — write ch number into low bits per factory */
-		doorbell_sta = readl(pcie->dbi_base + 0x380010);
-		doorbell_db = (doorbell_sta & ~7) | 0;
 		wmb();
-		writel(doorbell_db, pcie->dbi_base + 0x380010);
+		writel(0, pcie->dbi_base + 0x380010);
 		dmb(oshst);
-		dev_info(dev, "DMA: doorbell (0x380010) written 0x%08x\n",
-			 doorbell_db);
 
-		/* Poll for completion (either status or timeout) */
-		tries = 0;
-		while (tries < 1000) {
-			udelay(100);
-			v = readl(pcie->dbi_base + 0x38004C);
-			if ((v & 2) == 0)  /* bit 1 = active, 0 = idle */
-				break;
-			tries++;
-		}
-		dev_info(dev, "DMA: done tries=%d 0x38004C=0x%08x "
-			 "0x38000C=0x%08x 0x380054=0x%08x apb[0x10]=0x%08x\n",
-			 tries, readl(pcie->dbi_base + 0x38004C),
-			 readl(pcie->dbi_base + 0x38000C),
-			 rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054),
-			 readl(pcie->apb_base + 0x10));
+		udelay(10);
+		results[0] = readl(pcie->dbi_base + 0x38004C);
+		results[1] = readl(pcie->dbi_base + 0x38000C);
+		dev_info(dev, "A: direct db=0: 0x38004C=0x%08x 0x38000C=0x%08x\n",
+			 results[0], results[1]);
+
+		/* Approach B: doorbell with bit 0 set */
+		writel(0x40000302, pcie->dbi_base + 0x380200);
+		writel(0x0e000000, pcie->dbi_base + 0x38020C);
+		writel(0, pcie->dbi_base + 0x380210);
+		writel(8, pcie->dbi_base + 0x380214);
+		dmb(oshst);
+		writel(1, pcie->dbi_base + 0x380010);
+		dmb(oshst);
+		udelay(10);
+		results[2] = readl(pcie->dbi_base + 0x38004C);
+		dev_info(dev, "B: direct db=1: 0x38004C=0x%08x 0x38000C=0x%08x\n",
+			 results[2], readl(pcie->dbi_base + 0x38000C));
+
+		/* Approach C: direct mode with bit 3 set in doorbell cfg */
+		writel(0x4000030A, pcie->dbi_base + 0x380200);
+		writel(0x0e000000, pcie->dbi_base + 0x38020C);
+		writel(0, pcie->dbi_base + 0x380210);
+		writel(8, pcie->dbi_base + 0x380214);
+		dmb(oshst);
+		writel(0, pcie->dbi_base + 0x380010);
+		dmb(oshst);
+		udelay(10);
+		results[3] = readl(pcie->dbi_base + 0x38004C);
+		dev_info(dev, "C: cfg=0x4000030A db=0: 0x38004C=0x%08x 0x38000C=0x%08x\n",
+			 results[3], readl(pcie->dbi_base + 0x38000C));
+
+		/* Approach D: ring mode but with pre-set ring to immediate */
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
+		writel(v & ~3u, pcie->dbi_base + 0x380054);
+		writel(0x40000308, pcie->dbi_base + 0x380200);
+		writel(0, pcie->dbi_base + 0x380204);
+		writel(pcie->chan[0].ring_dma, pcie->dbi_base + 0x38021C);
+		writel(0, pcie->dbi_base + 0x380220);
+		dmb(oshst);
+		wmb();
+		writel(0, pcie->dbi_base + 0x380010);
+		dmb(oshst);
+		udelay(10);
+		results[4] = readl(pcie->dbi_base + 0x38004C);
+		results[5] = readl(pcie->dbi_base + 0x38000C);
+		results[6] = readl(pcie->dbi_base + 0x38021C);
+		results[7] = readl(pcie->dbi_base + 0x380220);
+		dev_info(dev, "D: ring 0x380220=0 db=0: 0x38004C=0x%08x 0x38000C=0x%08x "
+			 "ring=0x%08x/%08x\n",
+			 results[4], results[5],
+			 results[6], results[7]);
+
+		/* Approach E: ring mode with 0x380220=0x180 (original) */
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
+		writel(v & ~3u, pcie->dbi_base + 0x380054);
+		writel(0x40000308, pcie->dbi_base + 0x380200);
+		writel(0, pcie->dbi_base + 0x380204);
+		writel(pcie->chan[0].ring_dma, pcie->dbi_base + 0x38021C);
+		writel(0x180, pcie->dbi_base + 0x380220);
+		dmb(oshst);
+		wmb();
+		writel(0, pcie->dbi_base + 0x380010);
+		dmb(oshst);
+		udelay(10);
+		results[8] = readl(pcie->dbi_base + 0x38004C);
+		dev_info(dev, "E: ring 0x380220=0x180 db=0: 0x38004C=0x%08x "
+			 "0x38000C=0x%08x\n",
+			 results[8], readl(pcie->dbi_base + 0x38000C));
+
+		/* Check what value 0x380010 has after reads */
+		results[9] = readl(pcie->dbi_base + 0x380010);
+		dev_info(dev, "DMA: final 0x380010=0x%08x\n", results[9]);
 	}
 
 	return 0;
