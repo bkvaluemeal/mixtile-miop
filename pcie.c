@@ -851,6 +851,36 @@ static int miop_pcie_ep_probe(struct device *dev)
 	/* Controller / DLL configuration (DBI/APB pokes). */
 	miop_pcie_config_controller(pcie, ep);
 
+	/* Program per-channel DMA ring address + descriptor config into the
+	 * DBI APP region registers (pcie_asm.S batch-submit path lines 995-1014).
+	 * Without this the DMA engine cannot locate the descriptor ring. */
+	{
+		int i;
+		u32 v;
+
+		for (i = 0; i < MIOP_DMA_NUM_CH; i++) {
+			u32 base = 0x380000 + i * 0x200;
+			dma_addr_t dma = pcie->chan[i].ring_dma;
+
+			writel(0x40000308, pcie->dbi_base + base + 0x200);
+			writel(0,          pcie->dbi_base + base + 0x204);
+			writel((u32)dma,   pcie->dbi_base + base + 0x21C);
+			writel((u32)(dma >> 32), pcie->dbi_base + base + 0x220);
+		}
+
+		/* Enable per-channel interrupts in DBI+0x380090 (factory line 1031). */
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380090);
+		for (i = 0; i < MIOP_DMA_NUM_CH; i++)
+			v |= (1u << (16 + i));
+		writel(v, pcie->dbi_base + 0x380090);
+
+		/* Clear any stale doorbell-pending bits at DBI+0x380054. */
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
+		for (i = 0; i < MIOP_DMA_NUM_CH; i++)
+			v &= ~(1u << i);
+		writel(v, pcie->dbi_base + 0x380054);
+	}
+
 	/* MIOP tag + ring flag written to DBI (pcie_asm.S:2702-2723). */
 	writel(0x100000, pcie->dbi_base + 0x200e14);
 	writel(0x504f494d, pcie->dbi_base + 0x200e10);
