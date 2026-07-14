@@ -920,14 +920,12 @@ static int miop_pcie_ep_probe(struct device *dev)
 
 		/* Enable per-channel interrupts in DBI+0x380090 (factory line 1031). */
 		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380090);
-		for (i = 0; i < MIOP_DMA_NUM_CH; i++)
-			v |= (1u << (16 + i));
+		v |= 0x30000;
 		writel(v, pcie->dbi_base + 0x380090);
 
 		/* Clear any stale doorbell-pending bits at DBI+0x380054. */
 		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
-		for (i = 0; i < MIOP_DMA_NUM_CH; i++)
-			v &= ~(1u << i);
+		v &= ~3u;
 		writel(v, pcie->dbi_base + 0x380054);
 	}
 
@@ -977,7 +975,6 @@ static int miop_pcie_ep_probe(struct device *dev)
 	 * interrupt handler). Keep the ring-address/DBI register writes
 	 * before link training since the factory also programs those before. */
 	{
-		int i;
 		u32 v;
 
 		writel(1, pcie->dbi_base + 0x38000C);
@@ -1024,7 +1021,7 @@ static int miop_pcie_ep_probe(struct device *dev)
 		int tries;
 		u32 doorbell_sta, doorbell_db, v;
 
-		dev_info(dev, "DMA self-test BEGIN (%d channels)\n", pcie->num_chan);
+		dev_info(dev, "DMA self-test BEGIN (%d channels)\n", MIOP_DMA_NUM_CH);
 
 		writel(1, pcie->dbi_base + 0x38000C);
 		dmb(oshst);
