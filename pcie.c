@@ -3,19 +3,23 @@
 // pcie-ep-rk35: low-level RK35 PCIe endpoint + DMA driver for the Mixtile
 // TCP/IP-over-PCIe stack.
 //
-// This is the C reimplementation of the original pcie.S (decompiled from the
-// vendor .ko). It is the lowest layer of the stack: it owns the RK3588 PCIe EP
-// controller, trains the link against the peer blade, programs the inbound/
-// outbound iATU windows, wires up the MSI/legacy IRQ and runs the peer/link
-// handshake that eventually drives miop-ep-net.ko's on_peer_* callbacks.
+// C reimplementation of the factory pcie_asm.S. This is the lowest layer
+// of the stack: it owns the RK3588 PCIe EP controller, trains the link
+// against the peer blade, programs the inbound/outbound iATU windows, wires
+// up the MSI/legacy IRQ and runs the peer/link handshake that drives
+// miop-ep-net.ko's on_peer_* callbacks.
 //
-// This is the FIRST, intentionally-thin pass. The module registers the same
-// driver struct with miop-reg.ko (so miop-ep.ko's probe() will proceed and
-// hand control here via ->probe), but the real EP/link/DMA logic is stubbed:
-// miop_pcie_ep_probe() returns success without training the link. The link
-// therefore does not come up (expected for this pass); the RX/TX/ATU/IRQ logic
-// is filled in in a later pass. The RX ring alloc/free helpers used by this
-// layer live in ep.c (published through struct miop_ep_hw.func_a/func_b).
+// Status (2026-07-12):
+//   ✅ PCIe link trains to L0 (LTSSM = 0x230011)
+//   ✅ pci0 netdev created with IP and carrier
+//   ✅ on_peer_online succeeds (netif_carrier_on)
+//   ❌ TX data path (dma_submit) is a stub — ping via pci0 fails
+//   ❌ IRQ handler is a stub (clears status, does not reap DMA)
+//   ❌ DMA descriptor rings not yet wired
+//   ❌ Peer doorbell / handshake not implemented
+//
+// See docs/STATUS.md for the full translation progress and docs/ARCHITECTURE.md
+// for the system-level design.
 
 #include <linux/module.h>
 #include <linux/kernel.h>

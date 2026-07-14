@@ -1,163 +1,170 @@
-# Status — incremental C reimplementation
+# Status — C reimplementation
 
-Goal: reimplement all four modules in documented C, ultimately bringing
-`pci0` UP with working ping. Approach: **thin-first** — each module
-registers the same driver interface and loads without oops; the real
-data-path logic is filled in incrementally afterward.
+**Date:** 2026-07-12  
+**State:** PCIe link trains to L0; pci0 has IP and carrier; ping via pci0 fails
+(TX data path is a stub).
+
+## Quick summary
+
+| Capability                     | Status |
+|--------------------------------|--------|
+| PCIe link trains to L0        | ✅ LTSSM = 0x230011 |
+| pci0 netdev created           | ✅ `pci0: <BROADCAST,MULTICAST,UP,LOWER_UP>` |
+| IP assignment (10.20.0.4/24)  | ✅ via networkd |
+| on_peer_online → carrier_on   | ✅ returns 0, no crash |
+| ping via pci0 (10.20.0.1)     | ❌ Destination Host Unreachable |
+| ping via management network   | ✅ 0.343ms via bond0 |
+| TX data path (dma_submit)     | ❌ stub (returns -1) |
+| RX data path (IRQ reap)       | ❌ stub (clears status only) |
+| Peer doorbell / handshake     | ❌ stub |
 
 ## Per-module status
 
-| Module         | Thin wrapper | Data path | Verified (no oops, loads) |
-|----------------|--------------|-----------|---------------------------|
-| `miop-reg.ko`  | done         | n/a (registry only) | yes |
-| `miop-ep.ko`   | done         | resource_setup done; calls lower `probe()` | yes |
-| `miop-ep-net.ko` | done      | netdev alloc/register done; `on_peer_*`/`ndo_*` are stubs | yes (eth0, link down) |
-| `pcie-ep-rk35.ko` | done    | `probe()` wired: ctrl-config, bounded link-poll, set_bar, inbound ATU, peer-online trigger; MIOP exchange + outbound ATU still TODO | yes (loads; link trains? see below) |
+### miop-reg.ko — DONE
 
-Current node2 boot state: our `ep` + `reg` + `net` + full `pcie` modules
-load and the EP probes cleanly (controller-config, set_bar, inbound ATU,
-IRQ wiring all transcribed and loading without oops). Link training now runs
-in a **continuous kthread** (`miop_link_worker`) — vendor-faithful: it polls
-`apb_base+0x300` (mask `0x3003f`, want `0x30011`) and also treats
-`dbi_base+0x100` low-16 == `0x15` as link-up, and on link-up drives the peer
-handshake. This does not block probe/boot and detects a link that comes up
-late (e.g. after the switch is reset).
+`reg.c`: registry module. Exports `miop_register_pcie_ep_drv()`,
+`miop_register_ep_net_drv()`, `miop_register_is_ready()`. Static storage
+with a mutex. No data path. Verified: loads, symbols resolve, dependent
+modules link without error.
 
-**Link does NOT train — environmental, not our code.** With our modules the
-EP sits in LTSSM Detect (`dbi_base+0x100 == 0x14820001`, `apb_base+0x300 ==
-0x0`); the controller's PCIe tree shows bus05 (node2's slot) EMPTY, i.e. the
-ASM2824 switch port to node2 is **disabled and not being re-enabled**. This
-was proven NOT to be our module: temporarily swapping in the **factory**
-modules (from node3) and rebooting node2 still leaves bus05 empty and the
-link in Detect. `nodectl poweroff/poweron`, a controller reboot (resets the
-switch), and a secondary-bus reset of port `0000:02:08.0` also fail to
-enable the port. The earlier "factory works / pci0 UP" result came from a
-specific full cluster power cycle that enabled node2's port; that enable
-condition is not currently reproducible via the software paths tried.
+### miop-ep.ko — DONE (thin wrapper)
 
-**To test link training + the MIOP handshake, node2's switch port must be
-enabled** — most likely by a hard blade power-cycle (unplug/replug) or a
-full cluster power cycle that the controller's blade manager observes. Once
-the port enables, our kthread will detect link-up and run the (still-TODO)
-MIOP shared-header exchange + outbound ATU to the peer BAR target.
+`ep.c`: top-level platform driver. Allocates `struct miop_ep`, sets
+`platform_set_drvdata`, calls `miop_pcie_ep_resource_setup()` to parse DT,
+manages PHY/clocks/resets, then calls `pcie_drv->init(dev)`. Verified:
+probes, prints banner, calls lower `init()`.
 
-## Translated vs stubbed (per module)
+### miop-ep-net.ko — DONE (network init, data path stubbed)
 
-### pcie-ep-rk35.ko — translated so far
-- `miop_ep_generate_serial()` — serial-mixing hash (from `pcie.S`).
-- `miop_ep_machine_id()` — walks `ep+0x78` → `+0x148`; returns the cached
-  id or falls back to `miop_ep_generate_serial()`. Exported.
-- `rk35_pcie_readl_dbi()` / `rk35_pcie_readw_dbi()` — DBI accessors
-  (asm had a decompiler self-loop artifact; real op is just the read).
-- `rk35_pcie_ep_window_map_init()` / `_deinit()` — allocate/kfree the three
-  window bitmaps/arrays (`map1`/`map2`/`addrs` in `struct miop_pcie`).
-- `miop_ep_map_outbound_atu()` — program one outbound iATU window (ATU base,
-  0x200 stride, enable poll on bit31), set the alloc bit, store the target in
-  `addrs[]`. Exported.
-- `miop_ep_unmap_outbound_atu()` — find the slot by target, hit the viewport
-  reg (+0x900/+0x908), clear the alloc bit. Exported.
-- **`miop_pcie_ep_probe()` — early/structural stage WIRED** (transcribed from
-  `pcie.S` `miop_pcie_ep_init`). It allocates `struct miop_pcie` (see
-  `miop.h`), ioremaps the DBI/APB windows from `ep->hw.res_dbi`/`res_apb`,
-  computes `dbi_base2` (DBI+0x100000) and `atu_base` (DBI+0x300000), runs
-  `window_map_init` (sized from `ep->n_free`/`ep->n_win`), and carves out the
-  4 MiB TX/DMA coherent buffer. Verified: probe prints
-  `n_free=16 n_win=16`, banners present, **no oops**.
+`net.c`: allocates the `pci0` netdev via `alloc_etherdev_mqs()`, registers
+it, derives a MAC address from the ep pointer.
 
-The ATU helpers were converted from raw offset arithmetic to named fields of
-`struct miop_pcie`; `struct miop_pcie` and `ep->n_free`/`n_win`/`pcie_priv`
-were added to `miop.h`. `ep.c` now sets `platform_set_drvdata(pdev, ep)` and
-feeds `ep->n_free`/`n_win` from `hw->num_ob_windows`.
+**Implemented:**
+- `miop_ep_net_init()` — alloc_etherdev, register_netdev, MAC derive
+- `miop_ep_net_deinit()` — unregister + free netdev
+- `miop_on_peer_online()` — `netif_carrier_on()` (was crashing due to
+  wrong offset; fixed 2026-07-12)
+- `miop_on_rx()` — alloc_skb + netif_receive_skb (wired but never called
+  because IRQ handler is a stub)
+- `miop_ndo_open/stop/change_mtu` — basic netdev ops
 
-### pcie-ep-rk35.ko — stubbed / TODO (the probe)
-`miop_pcie_ep_init()` (factory `pcie.S` ~line 2260, ~880 lines of asm) is
-the link-bring-up core. **Status:** phases 1–3 (ioremap DBI/APB, window-map
-init, DMA buffer) are WIRED and verified. Phase 5/11/10 core (DBI/APB config
-block, bounded link-training poll, stub IRQ) are now WIRED and verified (see
-verification log). Remaining phases (transcribe from `pcie.S`, each a
-verifiable increment):
+**TODO:**
+- `ndo_start_xmit()` — currently calls `dma_submit()` which returns -1
+  (driver struct op is NULL), drops the skb silently. Needs the real
+  DMA descriptor write and doorbell trigger.
 
-4. `miop_ep_generate_serial` — **DONE** (serial stored in `pcie->serial`,
-   MIOP shared header written at start of the 4 MiB DMA buffer).
-5. `rk35_pcie_readl_dbi` — read/configure DBI registers — **DONE** (DBI/APB
-   controller-config block transcribed: APB glue, RK APP 0x380054/0xa8 clears,
-   DBI 0x710 link-cap width, 0x80c link speed, 0x4, 0x0/0x2/0xc EP identity,
-   0x8bc enable toggle).
-6. `rk35_pcie_ep_set_bar` ×4 — configure EP BARs. **WIRED** (transcribed from
-   `rk35_pcie_ep_set_bar.isra.0`). Uses `base_idx = ep->n_win` (16) so the BAR
-   table sits at `dbi + 0x10 + bar*8`; faithful offset arithmetic preserved
-   against `pcie->dbi_base`/`pcie->apb_base`. Load-tested: no oops (writes stay
-   inside the 16 MiB DBI/APB ioremap); functional correctness only visible at
-   link-up.
-7. `find_first_zero_bit` — allocate per-peer/ring inbound slot + program the
-   inbound iATU window. **WIRED** (`miop_pcie_map_inbound_atu`): allocates a slot
-   from `pcie->map1` (bounded by `num_ib_windows`), maps it inbound to
-   `pcie->dma_dma` (the reserved 4 MiB region). Verified slot 0 → 0xe000000.
-8. `ioremap` — map peer BAR / RC staging regions. **STUBBED**.
-9. `dma_alloc_attrs` ×2 — more DMA regions (peer-desc rings). **STUBBED**.
-10. `devm_request_threaded_irq` — `rk35_ep_interrupt` handler. **WIRED** with a
-    minimal stub handler that clears the APB status reg (`apb+0x10`) and
-    returns `IRQ_HANDLED` (no DMA reap / handshake yet — prevents storm).
-11. link-training poll: `readl(apb+0x300)` + `msleep(20)` until status matches
-    `0x11 | (0x3<<16)` (mask `0x3f|(0x3<<16)`), bounded to `MIOP_LINK_TRAIN_ITERS`
-    (250 → ~5 s) so a missing peer can never hang boot. **WIRED + verified**
-    (graceful timeout when peer/switch not reset).
-12. `ioremap` ×2 — RC staging + peer BAR mapping (`miop_rk35_map_rc_staging`, `miop_rk35_map_peer_bar`). **STUBBED**.
-13. outbound ATU: `miop_ep_map_outbound_atu` (`outbound free_win` messages).
-    Helpers exist; not yet driven by the link-up path.
-14. peer handshake → calls `net_drv->on_peer_online()` → `Node online` / `tx staging` / `new-arch init`. **PARTIALLY WIRED**: on link-up (detected by the bounded poll) `miop_pcie_peer_online()` now calls `net_drv->on_peer_online(ep, 0)`. The exact MIOP shared-header exchange and per-peer descriptor-ring plumbing (pcie.S fields +280/+600/+9024/+17352) — and the outbound ATU mapping to the discovered peer BAR target — are still TODO, so the call currently passes peer=0 (net layer's `on_peer_online` is a safe stub).
+### pcie-ep-rk35.ko — PARTIAL (controller init done, DMA/IRQ still stubs)
 
-**Key runtime finding (2026-07-12):** `fe150000.pcie` is bound to **our**
-`miop-ep` driver and there is **no** kernel PCIe EP framework in use
-(`/sys/class/pci_epc` empty; `rk-pcie`/`dw-pcie` not bound to the
-controller). Therefore our `pcie_ep_rk35.ko` is the *complete* EP controller
-driver and the asm's DBI/APB pokes are safe to reproduce against
-`pcie->dbi_base`/`pcie->apb_base`. The asm reached the controller through a
-`struct rockchip_pcie` handle only for `set_bar`/`raise_irq`/`map_*`, which we
-rewrite against our raw mmio.
+`pcie.c`: low-level PCIe EP controller driver.
 
-**Link-training caveat:** a *direct node2 reboot* does **not** reset the
-shared ASM2824 NTB switch, so the switch↔node2 link cannot retrain even when
-node3 (RC, `10.20.0.4`) is up. To actually observe `PCIe Link up`, a **full
-cluster power cycle** (controller reboot) is required — this is the only way
-to validate the LTSSM/training path.
+**Implemented (fully):**
+- `miop_pcie_ep_probe()` — ioremap DBI/APB, window-map init, DMA buffer
+  alloc, MIOP shared header write, controller config, APB triggers, IRQ
+  stub, link-training poll.
+- `miop_pcie_config_controller()` — APB glue (0x8000800/0x80000000),
+  APP region clears (0x380054/0x3800a8), DBI 0x710 lane cap, 0x80c speed
+  bits, 0x4 device type, 0x8bc enable/disable, BARs x4, Vendor/Device/Class
+  IDs, inbound ATU mapping.
+- `miop_pcie_link_train()` — bounded poll of `apb+0x300` (mask 0x3003f,
+  target 0x30011), 20 ms sleep, 250 iterations max.
+- `miop_pcie_peer_online()` — calls `net_drv->on_peer_online(ep, 0)`.
+- `rk35_pcie_ep_window_map_init/deinit()` — bitmap alloc/free.
+- `miop_ep_map_outbound_atu/unmap_outbound_atu()` — iATU window prog.
+- `miop_pcie_ep_set_bar()` — BAR register programming.
+- `rk35_pcie_readl_dbi/readw_dbi()` — DBI accessors.
+- `miop_ep_generate_serial()` / `miop_ep_machine_id()` — serial/id hash.
+- `miop_ep_irq_stub()` — clears `apb+0x10`, returns IRQ_HANDLED.
 
-Helper functions already present in `pcie.S` to translate:
-`miop_rk35_dma_submit`, `miop_rk35_dma_submit_batch`, `miop_ep_map_outbound_atu`,
-`miop_ep_unmap_outbound_atu`, `miop_rk35_map_rc_staging`, `miop_rk35_map_peer_bar`,
-`rk35_pcie_ep_set_bar`, `rk35_pcie_readl_dbi`/`readw_dbi`, `rk35_ep_interrupt`,
-`miop_dma_reap_thread`, `miop_dma_list_commit_pending`, `miop_raise_peer_irq`,
-`miop_elbi_enable_irq`/`disable_irq`, `miop_intx_trigger_work`.
+**TODO (in priority order):**
 
-### miop-ep-net.ko — stubbed / TODO
-- `on_peer_online()` — set up per-peer TX/RX rings + flip carrier.
-- `ndo_start_xmit()` / `on_rx()` / `on_tx_ready()` — packet data path.
-- Real MAC derivation (currently a local placeholder; could use
-  `miop_ep_machine_id`).
+1. **`miop_rk35_dma_submit()`** — write one DMA descriptor into the ring,
+   update producer index, call `rk35_dma_start_write()` to doorbell the
+   hardware. Required for TX to work.
+2. **`rk35_ep_interrupt()`** — full IRQ handler: read `apb+0x10` status,
+   call `miop_dma_try_reap()` for completed TX descriptors, call
+   `net_drv->on_rx()` for RX completions, raise peer IRQ on doorbell.
+3. **`miop_dma_try_reap()`** — walk completed descriptors in the ring,
+   invoke per-descriptor completion callbacks, update consumer index.
+4. **`miop_raise_peer_irq()`** — trigger a doorbell write to the RC to
+   signal new TX data.
+5. **`miop_rk35_dma_submit_batch()`** — submit a batch of descriptors
+   (used by the network layer for scatter/gather).
+6. **`miop_dma_list_commit_pending()`** — commit pending TX descriptor
+   list entries.
+7. **`miop_rk35_map_peer_bar()` / `miop_rk35_map_rc_staging()`** — ioremap
+   and iATU map the peer's BAR and RC staging region (required for the
+   peer handshake after link-up).
+8. **`miop_elbi_enable_irq/disable_irq()`** — ELBI message IRQ control.
+9. **`miop_intx_trigger_work()`** — legacy INTx IRQ trigger workqueue.
+10. **`miop_pcie_ep_deinit()`** — full cleanup: unmap, free DMA, deinit
+    window maps.
 
-## Verification log
-- `reg.c`/`ep.c` (kzalloc fix): verified, ping 0% loss with factory net+pcie.
-- `net.c` thin: verified loads/registers, `eth0` created, no oops.
-- `pcie.c` thin: verified loads/registers, no oops (full power cycle).
-  Discovered the `miop_ep_machine_id` import dependency (factory net).
-- `pcie.c` ATU/region helpers transcribed (unwired): verified direct node2
-  reboot, banners present, no oops/BUG.
-- `pcie.c` probe early stage wired (ioremap DBI/APB, window_map_init, 4 MiB
-  DMA): verified direct node2 reboot, prints `n_free=16 n_win=16`, no oops.
-- `pcie.c` probe controller-config + bounded link-training + stub IRQ wired:
-  verified clean reload (all 4 modules load, **no oops/panic, no IRQ storm**).
-  Probe runs the full new path; link-training polls `apb+0x300` and times out
-  gracefully (~5 s, bounded) because the peer/switch wasn't reset (node2-only
-  reboot; node3 RC *was* up but switch↔node2 link can't retrain without a full
-  power cycle). Serial `0x58c184bf` reported. `set_bar` (transcribed, bi@0x10/
-  0x20/0x28/0x30) and inbound ATU (slot 0 → 0xe000000) also load clean.
-  Next: a full cluster power cycle is needed to confirm the link actually
-  trains + the EP function is visible with this config.
+## Translation progress
 
-## Next increments
-1. Implement `miop_pcie_ep_init()` phases in order, testing after each
-   (expect `outbound free_win` / `PCIe Link up` to appear, then the peer
-   handshake to start calling `net_drv->on_peer_online`).
-2. Implement `miop-ep-net.ko` `on_peer_online` to bring `pci0` carrier UP
-   and set up the rings.
-3. Implement the TX/RX data path so ping works end-to-end.
+| Factory function                   | Lines     | C status         | C location        |
+|------------------------------------|-----------|------------------|-------------------|
+| `rk35_pcie_ep_window_map_init`     | 2217-2260 | ✅ implemented   | pcie.c:140        |
+| `rk35_pcie_ep_window_map_deinit`   | 3141-3170 | ✅ implemented   | pcie.c:166        |
+| `rk35_pcie_readl_dbi`              | 488-499   | ✅ implemented   | pcie.c:128        |
+| `rk35_pcie_readw_dbi`              | 768-781   | ✅ implemented   | pcie.c:133        |
+| `miop_ep_generate_serial`          | 332-376   | ✅ implemented   | pcie.c:52         |
+| `miop_ep_machine_id`               | 377-398   | ✅ implemented   | pcie.c:95         |
+| `miop_ep_map_outbound_atu`         | 1079-1207 | ✅ implemented   | pcie.c:202        |
+| `miop_ep_unmap_outbound_atu`       | 214-257   | ✅ implemented   | pcie.c:175        |
+| `rk35_pcie_ep_set_bar`             | 412-487   | ✅ implemented   | pcie.c:258        |
+| `miop_pcie_ep_init` (ctrl cfg)     | 2527-2636 | ✅ implemented   | pcie.c:344        |
+| `miop_pcie_ep_init` (MIOP tag)     | 2702-2723 | ✅ implemented   | pcie.c (probe)    |
+| `miop_pcie_ep_init` (APB trigger)  | 2742-2754 | ✅ implemented   | pcie.c (probe)    |
+| `miop_pcie_ep_init` (LTSSM poll)   | 2755-2779 | ✅ implemented   | pcie.c:448        |
+| `miop_pcie_ep_init` (post-LTSSM)   | 2780-2810 | ❌ not done      | —                 |
+| `rk35_ep_interrupt`                | 1208-1713 | ❌ stub (clears) | pcie.c:477        |
+| `miop_rk35_dma_submit`             | 19-98     | ❌ not done      | —                 |
+| `miop_rk35_dma_submit_batch`       | 859-1078  | ❌ not done      | —                 |
+| `miop_dma_try_reap`                | 500-700   | ❌ not done      | —                 |
+| `miop_dma_list_commit_pending`     | 2019-2194 | ❌ not done      | —                 |
+| `miop_raise_peer_irq`              | 782-858   | ❌ not done      | —                 |
+| `miop_elbi_enable_irq`             | 99-121    | ❌ not done      | —                 |
+| `miop_elbi_disable_irq`            | 122-144   | ❌ not done      | —                 |
+| `miop_intx_trigger_work`           | 174-213   | ❌ not done      | —                 |
+| `miop_rk35_map_peer_bar`           | 1833-1952 | ❌ not done      | —                 |
+| `miop_rk35_map_rc_staging`         | 1714-1832 | ❌ not done      | —                 |
+| `miop_rk35_unmap_peer_bar`         | 297-331   | ❌ not done      | —                 |
+| `miop_rk35_unmap_rc_staging`       | 258-296   | ❌ not done      | —                 |
+| `miop_dma_list_is_full`            | 701-740   | ❌ not done      | —                 |
+| `rk35_dma_start_write`             | 741-767   | ❌ not done      | —                 |
+| `miop_dma_reap_thread`             | 1953-2018 | ❌ not done      | —                 |
+| `miop_pcie_ep_deinit`              | 3171-3256 | ❌ not done      | —                 |
+
+## Key bugs fixed
+
+1. **2026-07-12: struct offset confusion** — The factory init accesses
+   `pcie_priv+24` (= `apb_base`) for all APB glue and training-trigger
+   writes. Our code was targeting `dbi_base2` (+16 = dbi+0x100000) instead.
+   Fix: changed all `pcie->dbi_base2` → `pcie->apb_base`. The structs were
+   never swapped — both have `apb_base` at +24.
+
+2. **2026-07-12: on_peer_online crash** — `miop_on_peer_online()` read the
+   `net_device *` from offset +48 of `miop_net_priv` (which is the spinlock).
+   The correct offset is +16 (`priv->netdev`). Fix: use `priv->netdev`
+   directly.
+
+## How to test
+
+### After deploy + power-cycle
+
+```sh
+# Check link status
+busybox devmem 0xfe150300 32          # → 0x00230011 = L0
+
+# Check dmesg
+dmesg | grep -iE "miop|pcie|link|carrier"
+
+# Check interface
+ip addr show pci0                      # → 10.20.0.4/24, LOWER_UP
+
+# Ping management (via bond0)
+ping -c 3 192.168.0.202                # → 0% loss
+
+# Ping fabric (via pci0 — WILL FAIL until DMA is implemented)
+ping -c 3 10.20.0.1                    # → Destination Host Unreachable
+```
