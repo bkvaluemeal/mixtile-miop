@@ -1132,13 +1132,13 @@ static int miop_pcie_ep_probe(struct device *dev)
 	pcie->atu_base = (char __iomem *)dbi_base + 0x300000;
 
 	/* The factory's ELBI block (DBI 0x838200) lives outside the 4 MiB DBI
-	 * window, in the 8 MiB DBI2 window @0xa40800000 (devicetree
-	 * fe170000.pcie pcie-dbi).  Map it separately for ELBI access. */
-	pcie->dbi_base2 = devm_ioremap(dev, 0xa40800000ULL, 0x800000);
-	if (IS_ERR_OR_NULL(pcie->dbi_base2)) {
-		dev_warn(dev, "ioremap DBI2 failed, ELBI disabled\n");
-		pcie->dbi_base2 = NULL;
-	}
+	 * window.  The correct physical base must be derived from the factory
+	 * pcie_ep_drv struct (ep_drv+8); the devicetree DBI aperture for
+	 * fe150000.pcie is only a40000000-a403fffff, so a hardcoded 0xa40800000
+	 * is outside the aperture and faults.  Leave dbi_base2 NULL for now so
+	 * ELBI writes are skipped; revisit once the real base is known. */
+	pcie->dbi_base2 = NULL;
+	dev_warn(dev, "ELBI DBI2 window not mapped yet; ELBI disabled\n");
 
 	apb_base = devm_ioremap_resource(dev, ep->hw.res_apb);
 	if (IS_ERR(apb_base)) {
@@ -1272,8 +1272,11 @@ static int miop_pcie_ep_probe(struct device *dev)
 	 * (and TX-ready) doorbell interrupt never fires.  The doorbell sources
 	 * are in the low ELBI groups; enable a generous range to cover all
 	 * peer/source combinations (pcie_asm.S miop_elbi_enable_irq). */
-	for (i = 0; i < 16; i++)
+	for (i = 0; i < 16; i++) {
+		if (!pcie->dbi_base2)
+			break;
 		miop_elbi_enable_irq(pcie, i);
+	}
 
 	/* Map each peer's RX doorbell window.  The peer EP doorbell target
 	 * (where we write to assert the peer's RX doorbell) follows the pattern
@@ -1465,8 +1468,10 @@ static struct dentry *miop_dbg_dir;
 
 static int __init miop_pcie_ep_module_init(void)
 {
+	printk(KERN_ERR "MIOP_PCIE_INIT_ENTER\n");
 	printk(KERN_INFO "Mixtile TCP/IP over PCIe RK35 EP driver\n");
 	miop_register_pcie_ep_drv(&miop_pcie_driver);
+	printk(KERN_ERR "MIOP_PCIE_INIT_AFTER_REG drv=%px\n", &miop_pcie_driver);
 	miop_dbg_dir = debugfs_create_dir("miop", NULL);
 	if (miop_dbg_dir)
 		debugfs_create_file("poke", 0200, miop_dbg_dir, NULL,
@@ -1486,3 +1491,6 @@ static void __exit miop_pcie_ep_module_exit(void)
 	miop_register_pcie_ep_drv(NULL);
 	printk(KERN_INFO "Mixtile TCP/IP over PCIe RK35 EP driver exit\n");
 }
+
+module_init(miop_pcie_ep_module_init);
+module_exit(miop_pcie_ep_module_exit);

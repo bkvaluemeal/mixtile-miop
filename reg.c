@@ -55,6 +55,7 @@ void *miop_register_pcie_ep_drv(void *drv)
 	else
 		drv = (void *)miop_reg.pcie_ep_drv;
 	mutex_unlock(&miop_reg_lock);
+	printk(KERN_ERR "MIOP_REG_PCIE_EP_DRV set=%d val=%px\n", !!drv, drv);
 	return drv;
 }
 EXPORT_SYMBOL(miop_register_pcie_ep_drv);

@@ -303,15 +303,14 @@ static int miop_ep_probe(struct platform_device *pdev)
 
 	printk(KERN_INFO "Mixtile TCP/IP over PCIe EP driver probe\n");
 
-	/* Block until the two lower layers have registered their driver
-	 * structs, polling once per second for up to six seconds. */
-	while (!miop_register_is_ready()) {
-		if (--retries == 0) {
-			dev_err(dev, "Sub-drivers are not ready, exit\n");
-			return -EPROBE_DEFER;
-		}
-		dev_warn(dev, "Sub-drivers are not ready, waiting...\n");
-		msleep(1000);
+	/* Do NOT block waiting for the lower layers: a blocking wait here
+	 * deadlocks module load (pcie-ep-rk35.ko, which publishes pcie_ep_drv,
+	 * depends on this module and cannot load until this init returns).
+	 * Return EPROBE_DEFER so the kernel re-probes us once pcie-ep-rk35.ko
+	 * has published its driver struct. */
+	if (!miop_register_is_ready()) {
+		dev_warn(dev, "Sub-drivers are not ready, deferring probe\n");
+		return -EPROBE_DEFER;
 	}
 
 	/* The original binary allocates the ep struct zeroed (kzalloc); several
