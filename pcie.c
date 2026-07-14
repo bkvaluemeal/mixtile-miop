@@ -446,15 +446,24 @@ static void miop_pcie_peer_online(struct miop_pcie *pcie)
 {
 	struct miop_ep *ep = pcie->ep;
 	struct miop_ep_net_driver *net = ep->net_drv;
-	int ret;
+	int i;
 
 	if (!net || !net->on_peer_online)
 		return;
-	/* TODO: target = peer BAR base from MIOP header; then
-	 * miop_ep_map_outbound_atu(pcie, target, size, extra). */
-	ret = net->on_peer_online(ep, 0);
-	dev_info(pcie->dev,
-		 "peer online -> net_drv->on_peer_online(peer=0) = %d\n", ret);
+
+	/* Bring up every potential peer and announce our presence by writing a
+	 * peer-online doorbell into each destination node's EP doorbell window
+	 * (bit[0] = peer online, bits[8:15] = our source id, per the factory
+	 * rx_ep_interrupt decode).  The peer answers with its own doorbell,
+	 * which our RX path turns into on_peer_online on that side. */
+	for (i = 0; i < 4; i++) {
+		int ret = net->on_peer_online(ep, i);
+
+		dev_info(pcie->dev,
+			 "peer online -> net_drv->on_peer_online(peer=%d) = %d\n",
+			 i, ret);
+		miop_raise_peer_irq(pcie->ep->dev, i, 0x1);
+	}
 }
 
 /*
@@ -1296,25 +1305,27 @@ static int miop_pcie_ep_probe(struct device *dev)
 		miop_elbi_enable_irq(pcie, i);
 	}
 
-	/* Map each peer's RX doorbell window via map_peer_bar (which programs
-	 * the outbound iATU so the doorbell write actually crosses the fabric).
-	 * The peer EP doorbell target (where we write to assert the peer's RX
-	 * doorbell) follows node1's factory PEER_DESC/ELBI table: base
-	 * 0x900020000, stride 0x40000 per peer. */
+	/* Map each destination node's RX doorbell window via map_peer_bar (which
+	 * programs the outbound iATU so the doorbell write actually crosses the
+	 * fabric).  The peer EP doorbell targets (where we write to assert the
+	 * peer's RX doorbell) follow node1's factory PEER_ELBI/PEER_DESC table:
+	 * node N's window is at 0x900040000 + N*0x40000 (node0=0x900020000,
+	 * node1=0x900040000, node2=0x900080000, node3=0x9000c0000).  Index the
+	 * table by DESTINATION NODE so raise_peer_irq(N) hits the right EP. */
 	for (i = 0; i < 4; i++) {
-		u64 elbi_pa = 0x900020000ULL + (u64)i * 0x40000ULL;
+		u64 elbi_pa = 0x900040000ULL + (u64)i * 0x40000ULL;
 		u64 out_phys = 0;
 		void *va;
 
 		va = miop_rk35_map_peer_bar(dev, i, elbi_pa, 0x1000, &out_phys);
 		if (!va) {
-			dev_warn(dev, "map_peer_bar peer%d doorbell 0x%llx failed\n",
+			dev_warn(dev, "map_peer_bar node%d doorbell 0x%llx failed\n",
 				 i, (unsigned long long)elbi_pa);
 			pcie->peer_db_base[i] = NULL;
 		} else {
 			pcie->peer_db_base[i] = va;
 			pcie->peer_db_off[i] = 0;
-			dev_info(dev, "mapped peer%d doorbell @0x%llx -> %px\n",
+			dev_info(dev, "mapped node%d doorbell @0x%llx -> %px\n",
 				 i, (unsigned long long)elbi_pa, va);
 		}
 	}
