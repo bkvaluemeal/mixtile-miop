@@ -353,8 +353,19 @@ static void miop_pcie_config_controller(struct miop_pcie *pcie,
 	u32 lanes = ep->hw.num_lanes ? ep->hw.num_lanes : 4;
 	u32 v, cap;
 
-	/* APB glue — factory writes to apb_base (pcie_priv+24). */
-	writel(0x8000800, apb);
+	/* APB glue — factory writes to apb_base three times at probe:
+	 *   apb[0x180] = 0x100010   — APB control
+	 *   apb[0]     = 0xf00000   — APB glue (first)
+	 *   apb[0]     = 0xc000c    — APB glue (second, overwrites first)
+	 * Bits 2/3 in 0xc000c likely enable DMA channel completion IRQs. */
+	writel(0x100010, apb + 0x180);
+	writel(0xf00000, apb);
+	writel(0xc000c,  apb);
+
+	/* Enable all interrupt sources (DMA completion, doorbell, etc.)
+	 * on the APB interrupt enable register (DWC standard: +0x18). */
+	writel(0x0000ffff, apb + 0x18);
+
 	writel(0x80000000, apb + 0x24);
 
 	/* RK APP region (DBI + 0x380000): clear two control registers. */
@@ -846,7 +857,6 @@ static int miop_pcie_ep_probe(struct device *dev)
 
 	/* Trigger link training: three writes to apb_base (pcie_asm.S:2742-2754). */
 	if (pcie->apb_base) {
-		writel(0x100010, pcie->apb_base + 0x180);
 		writel(0xf00000, pcie->apb_base);
 		writel(0xc000c,  pcie->apb_base);
 		dev_info(pcie->dev,
