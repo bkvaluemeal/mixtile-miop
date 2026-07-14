@@ -554,6 +554,27 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 	dev_info(pcie->dev, "dma_submit ch=%u prod=%u len=%u dma=%llx desc[%u].status=%u\n",
 		 ch, chan->prod_idx, len, data, idx, desc->status);
 	rk35_dma_start_write(pcie, ch);
+
+	/* Poll for completion with timeout (bypass missing GIC IRQ) */
+	{
+		int tries = 1000;
+		while (tries-- && (desc->status & 1)) {
+			cpu_relax();
+			udelay(10);
+		}
+		if (!(desc->status & 1)) {
+			dev_info(pcie->dev, "dma_submit ch=%u desc[%u] consumed after %d us\n",
+				 ch, idx, (1000 - tries) * 10);
+		} else {
+			dev_info(pcie->dev, "dma_submit ch=%u desc[%u] NOT consumed after 10ms "
+				 "0x380010=0x%08x 0x38004C=0x%08x apb[0x10]=0x%08x\n",
+				 ch, idx,
+				 readl(pcie->dbi_base + 0x380010),
+				 readl(pcie->dbi_base + 0x38004C),
+				 readl(pcie->apb_base + 0x10));
+		}
+	}
+
 	if (miop_dma_try_reap(pcie, ch))
 		dev_info(pcie->dev, "try_reap after submit: reaped on ch%u\n", ch);
 	return 0;
