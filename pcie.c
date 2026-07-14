@@ -345,15 +345,13 @@ static void miop_pcie_config_controller(struct miop_pcie *pcie,
 					struct miop_ep *ep)
 {
 	void __iomem *dbi = pcie->dbi_base;
-	void __iomem *dbi2 = pcie->dbi_base2;
+	void __iomem *apb = pcie->apb_base;
 	u32 lanes = ep->hw.num_lanes ? ep->hw.num_lanes : 4;
 	u32 v, cap;
 
-	/* APB glue — factory writes these to dbi_base2 (pcie_priv+16), NOT apb.
-	 * Factory struct: +16=dbi_base2, +24=apb_base. Our struct has them
-	 * swapped, so target dbi_base2 explicitly. */
-	writel(0x8000800, dbi2);
-	writel(0x80000000, dbi2 + 0x24);
+	/* APB glue — factory writes to apb_base (pcie_priv+24). */
+	writel(0x8000800, apb);
+	writel(0x80000000, apb + 0x24);
 
 	/* RK APP region (DBI + 0x380000): clear two control registers. */
 	writel(0, dbi + 0x380000 + 0x54);
@@ -565,17 +563,15 @@ static int miop_pcie_ep_probe(struct device *dev)
 	/* Controller / DLL configuration (DBI/APB pokes). */
 	miop_pcie_config_controller(pcie, ep);
 
-	/* Trigger link training: three writes to dbi_base2 (pcie_asm.S:2742-2754).
-	 * Factory struct has dbi_base2 at +16, apb_base at +24; in our struct
-	 * the offsets are swapped, so target pcie->dbi_base2 explicitly. */
-	if (pcie->dbi_base2) {
-		writel(0x100010, pcie->dbi_base2 + 0x180);
-		writel(0xf00000, pcie->dbi_base2);
-		writel(0xc000c,  pcie->dbi_base2);
+	/* Trigger link training: three writes to apb_base (pcie_asm.S:2742-2754). */
+	if (pcie->apb_base) {
+		writel(0x100010, pcie->apb_base + 0x180);
+		writel(0xf00000, pcie->apb_base);
+		writel(0xc000c,  pcie->apb_base);
 		dev_info(pcie->dev,
-			 "dbi2[0x180]=%08x dbi2[0]=%08x\n",
-			 readl(pcie->dbi_base2 + 0x180),
-			 readl(pcie->dbi_base2));
+			 "apb[0x180]=%08x apb[0]=%08x\n",
+			 readl(pcie->apb_base + 0x180),
+			 readl(pcie->apb_base));
 	}
 
 	/* Bounded link-training poll. */
