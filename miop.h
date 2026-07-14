@@ -171,6 +171,6 @@ void miop_pcie_rx_region_free(struct device *dev, struct miop_ep_hw *hw, unsigne
  * First argument is struct miop_pcie *; phys=0 lets it pick the canonical
  * per-peer window (0x90000000 + peer<<25). Returns ioremap'd VA, *out_phys
  * gets the window's fabric address. */
-void *miop_rk35_map_peer_bar(void *pcie, u32 peer, u64 phys, u32 size, u64 *out_phys);
+void *miop_rk35_map_peer_bar(struct device *pcie, u32 peer, u64 phys, u32 size, u64 *out_phys);
 
 #endif /* MIOP_H */
