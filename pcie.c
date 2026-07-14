@@ -572,6 +572,10 @@ static int miop_pcie_ep_probe(struct device *dev)
 		writel(0x100010, pcie->dbi_base2 + 0x180);
 		writel(0xf00000, pcie->dbi_base2);
 		writel(0xc000c,  pcie->dbi_base2);
+		dev_info(pcie->dev,
+			 "dbi2[0x180]=%08x dbi2[0]=%08x\n",
+			 readl(pcie->dbi_base2 + 0x180),
+			 readl(pcie->dbi_base2));
 	}
 
 	/* Bounded link-training poll. */
