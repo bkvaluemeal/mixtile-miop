@@ -1313,12 +1313,13 @@ static int miop_pcie_ep_probe(struct device *dev)
 
 	/* Per-peer TX data window + RX doorbell window, one per destination node.
 	 * The factory encodes the address as 0x90000000 + (DEST_NODE<<24) +
-	 * (SRC_PEER_IDX<<20) + offset, where SRC_PEER_IDX is THIS node's peer
-	 * slot in the peer's EP.  node1->node2 uses peer[1]=0x903000000,
-	 * node2->node1 uses peer[0]=0x901000000.  For node3 (SRC_PEER_IDX=2):
-	 * data to node1 = 0x901000000, doorbell to node1 = 0x900080000. */
+	 * (SRC_NODE<<20) + offset, where SRC_NODE is THIS node's id.  A node
+	 * listens for incoming data at 0x90<SRC_NODE>000000: node1->node2 data
+	 * lands at 0x903000000, node2->node1 at 0x901000000, node3 receives at
+	 * 0x903000000.  So node3 writing to node1 uses 0x903000000 and doorbell
+	 * 0x9000c0000. */
 	for (i = 0; i < 4; i++) {
-		u64 win_base = 0x90000000ULL + ((u64)i << 24) + (2ULL << 20);
+		u64 win_base = 0x90000000ULL + ((u64)i << 24) + (3ULL << 20);
 		u64 data_pa = win_base + 0x100000ULL;
 		u64 db_pa   = win_base;
 		u64 out_phys = 0;
