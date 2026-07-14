@@ -1016,7 +1016,8 @@ static int miop_pcie_ep_probe(struct device *dev)
 		 ep->n_free, ep->n_win, pcie->serial,
 		 pcie->link_up ? "up" : "down");
 
-	/* DMA self-test: write a minimal descriptor and doorbell */
+	/* DMA self-test: write a minimal descriptor and doorbell.
+	 * Destination = 0x900000000 (RC-assigned peer window base). */
 	{
 		struct miop_dma_desc *d = pcie->chan[0].ring;
 		u32 v, r;
@@ -1026,6 +1027,7 @@ static int miop_pcie_ep_probe(struct device *dev)
 		d->len = 8;
 		d->addr_low = (u32)pcie->dma_dma;
 		d->addr_high = 0;
+		*(u64 *)((char *)d + 16) = 0x900000000ULL;
 		wmb();
 		d->status = 1;
 		wmb();
