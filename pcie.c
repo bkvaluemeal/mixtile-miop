@@ -1019,6 +1019,7 @@ static int miop_pcie_ep_probe(struct device *dev)
 	/* DMA self-test: match old working test exactly */
 	{
 		struct miop_dma_desc *d = pcie->chan[0].ring;
+		u32 v;
 
 		/* Write a descriptor to the ring */
 		memset(d, 0, sizeof(*d));
