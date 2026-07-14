@@ -9,11 +9,20 @@ sudo3() {
     sshpass -p "$NPASS" ssh -o StrictHostKeyChecking=no "$NUSER@$NODE3" "sudo -S sh"
 }
 
-echo "==> git clone on node3 =="
-sudo3 "\
-  cd /root && \
-  rm -rf miop && \
-  git clone https://github.com/bkvaluemeal/mixtile-miop.git miop"
+echo "==> tar source, push via sudo =="
+# Create tarball locally (use * instead of . to avoid --exclude='.*' matching the root)
+cd /root/miop
+tar czf /tmp/miop_src.tar.gz \
+  --exclude='*.ko' --exclude='*.o' --exclude='.*' --exclude='*.mod*' \
+  --exclude='Module.symvers' --exclude='modules.order' --exclude='*.cmd' \
+  * docs/ include/ 2>&1 | tail -3
+cd /root
+# Push tarball as normal user to /tmp
+sshpass -p "$NPASS" scp -o StrictHostKeyChecking=no \
+  /tmp/miop_src.tar.gz "$NUSER@$NODE3:/tmp/"
+# Extract as root on node3
+sudo3 "rm -rf /root/miop && mkdir -p /root/miop && tar xzf /tmp/miop_src.tar.gz -C /root/miop && chown -R root:root /root/miop && rm -f /tmp/miop_src.tar.gz"
+rm -f /tmp/miop_src.tar.gz
 
 echo "==> build on node3 =="
 sudo3 "cd /root/miop && make clean 2>/dev/null; make 2>&1 | tail -40"

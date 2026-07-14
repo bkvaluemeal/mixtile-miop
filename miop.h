@@ -16,6 +16,13 @@
 struct miop_ep;
 struct miop_pcie;
 
+/* RX doorbell header: the peer writes this local-memory descriptor and points
+ * the RX doorbell (db_val bits[31:16]) at it before ringing the bell. */
+struct miop_rx_hdr {
+	u32 len;
+	u64 buf_addr;
+};
+
 #define MIOP_DMA_RING_SIZE 128
 #define MIOP_DMA_RING_STRIDE (MIOP_DMA_RING_SIZE * sizeof(struct miop_dma_desc) + sizeof(struct miop_dma_desc))
 #define MIOP_DMA_NUM_CH 2
@@ -107,6 +114,7 @@ struct miop_pcie_channel {
 	dma_addr_t ring_dma;
 	u16 prod_idx;
 	u16 cons_idx;
+	u8 busy[MIOP_DMA_RING_SIZE];  /* software in-flight marker */
 	spinlock_t lock;
 	struct miop_dma_track track[MIOP_DMA_RING_SIZE];
 };
@@ -125,12 +133,16 @@ struct miop_pcie {
 	dma_addr_t dma_dma;
 	void __iomem *peer_bar_base;
 	u64 peer_bar_phys;
+	void __iomem *peer_db_base[4];
+	u64 peer_db_off[4];
 	int link_slot;
 	u32 serial;
 	int link_up;
 	struct task_struct *link_task;
 	struct timer_list reap_timer;
 	struct delayed_work bar_check_work;
+	struct delayed_work rx_poll_work;
+	u32 last_doorbell;
 	struct miop_pcie_channel chan[MIOP_DMA_NUM_CH];
 };
 

@@ -33,8 +33,12 @@
 #include <linux/interrupt.h>
 #include <linux/of_irq.h>
 #include <linux/workqueue.h>
+#include <linux/debugfs.h>
 
 #include "miop.h"
+
+/* Single active instance (one PCIe EP on the RK35 board). */
+static struct miop_pcie *g_pcie;
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Mixtile TCP/IP over PCIe RK35 EP driver (C pass)");
@@ -515,8 +519,9 @@ static void rk35_dma_start_write(struct miop_pcie *pcie, u32 ch)
 	writel((1u << ch) | (1u << (16 + ch)), pcie->dbi_base + 0x380058);
 	dmb(oshst);
 
-	/* 6. Doorbell — write 1<<ch to trigger the channel */
-	writel(1u << ch, pcie->dbi_base + 0x380010);
+	/* 6. Doorbell — write channel number (bits [2:0] selects channel) */
+	v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
+	writel((v & ~7) | ch, pcie->dbi_base + 0x380010);
 }
 
 static void rk35_dma_start_write(struct miop_pcie *pcie, u32 ch);
@@ -529,6 +534,8 @@ static int miop_dma_try_reap(struct miop_pcie *pcie, u32 ch);
  * Writes the descriptor to ring[prod_idx], stores the completion tracking
  * entry, advances the producer index, then doorbells the hardware.
  */
+static int miop_raise_peer_irq(struct device *dev, u32 peer_id, u32 vector);
+
 static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 				u64 ext, u32 len, u64 cookie, void *cb)
 {
@@ -550,8 +557,8 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 	desc = &chan->ring[idx];
 	track = &chan->track[idx];
 
-	if (desc->status & 1) {
-		dev_err(pcie->dev, "dma_submit: ring[%u] full, advancing\n", idx);
+	if (chan->busy[idx]) {
+		dev_dbg(pcie->dev, "dma_submit: ring[%u] busy, advancing\n", idx);
 		idx = (idx + 1) & (MIOP_DMA_RING_SIZE - 1);
 		chan->prod_idx = idx;
 		desc = &chan->ring[idx];
@@ -569,10 +576,24 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 	track->cb     = cb;
 	track->dma    = (dma_addr_t)data;
 	track->len    = len;
+	chan->busy[idx] = 1;
 
 	wmb();
-	desc->status = 1;
+	/* eDMA Cycle Bit (CB) is POSITIONAL: the engine resets its internal
+	 * CB to 1 at the ring base on every doorbell re-fetch and alternates
+	 * (1,0,1,0...) across consecutive slots.  A positional pattern therefore
+	 * matches every fetch pass.  Bit 0 is LIE (local interrupt enable). */
+	desc->status = ((idx + 1) & 1) | 0x8;
 	wmb();
+
+	/* Terminator: the next ring element gets the opposite-phase CB so the
+	 * engine stops after the last submitted descriptor. */
+	{
+		struct miop_dma_desc *next =
+			&chan->ring[(idx + 1) & (MIOP_DMA_RING_SIZE - 1)];
+		next->status = ((idx + 2) & 1);
+		wmb();
+	}
 
 	chan->prod_idx = (idx + 1) & (MIOP_DMA_RING_SIZE - 1);
 
@@ -584,32 +605,42 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 
 	spin_unlock_irqrestore(&chan->lock, flags);
 
-	dev_info(pcie->dev, "dma_submit ch=%u prod=%u len=%u dma=%llx desc[%u].status=%u\n",
-		 ch, chan->prod_idx, len, data, idx, desc->status);
 	rk35_dma_start_write(pcie, ch);
 
-	/* Poll for completion with timeout (bypass missing GIC IRQ) */
+	/* Notify every peer that new TX data is available (factory's
+	 * dma_submit raises the RX doorbell after the eDMA write lands).
+	 * The peer's EP receives this inbound write as its RX doorbell. */
+	if (pcie->peer_db_base[0])
+		miop_raise_peer_irq(dev, 0, 1);
+	if (pcie->peer_db_base[1])
+		miop_raise_peer_irq(dev, 1, 1);
+
+	/* Poll WRITE_INT_STATUS for completion (bypass missing GIC IRQ).
+	 * Completion is bit[ch] of 0x38004C; the descriptor control field is
+	 * never written back by hardware. */
 	{
 		int tries = 1000;
-		while (tries-- && (desc->status & 1)) {
+		u32 st;
+
+		do {
+			st = readl(pcie->dbi_base + 0x38004C);
+			if (st & ((1u << ch) | (1u << (ch + 16))))
+				break;
 			cpu_relax();
 			udelay(10);
-		}
-		if (!(desc->status & 1)) {
-			dev_info(pcie->dev, "dma_submit ch=%u desc[%u] consumed after %d us\n",
-				 ch, idx, (1000 - tries) * 10);
-		} else {
-			dev_info(pcie->dev, "dma_submit ch=%u desc[%u] NOT consumed after 10ms "
-				 "0x380010=0x%08x 0x38004C=0x%08x apb[0x10]=0x%08x\n",
-				 ch, idx,
-				 readl(pcie->dbi_base + 0x380010),
-				 readl(pcie->dbi_base + 0x38004C),
-				 readl(pcie->apb_base + 0x10));
-		}
+		} while (--tries);
+
+		if (!(st & ((1u << ch) | (1u << (ch + 16)))))
+			dev_err(pcie->dev, "dma_submit ch=%u desc[%u] NOT done after 10ms "
+				"0x380010=0x%08x 0x38004C=0x%08x apb[0x10]=0x%08x\n",
+				ch, idx,
+				readl(pcie->dbi_base + 0x380010),
+				readl(pcie->dbi_base + 0x38004C),
+				readl(pcie->apb_base + 0x10));
 	}
 
 	if (miop_dma_try_reap(pcie, ch))
-		dev_info(pcie->dev, "try_reap after submit: reaped on ch%u\n", ch);
+		dev_dbg(pcie->dev, "try_reap after submit: reaped on ch%u\n", ch);
 	return 0;
 }
 
@@ -623,6 +654,26 @@ static int miop_dma_try_reap(struct miop_pcie *pcie, u32 ch)
 	struct miop_pcie_channel *chan = &pcie->chan[ch];
 	u16 done = 0;
 	unsigned long flags;
+	u32 int_status;
+
+	/* Completion is signalled by the DMA WRITE_INT_STATUS register
+	 * (0x38004C) bit[ch]; bit[ch+16] indicates an abort/error.  We reap
+	 * whenever the engine says a descriptor finished OR there is still
+	 * pending work in the ring (the submit poll may have already cleared
+	 * the INT bit, so gating only on it would leave slots marked busy). */
+	int_status = readl(pcie->dbi_base + 0x38004C);
+	if (!(int_status & ((1u << ch) | (1u << (ch + 16)))) &&
+	    chan->cons_idx == chan->prod_idx)
+		return 0;
+
+	if (int_status & (1u << (ch + 16)))
+		dev_err(pcie->dev, "dma ch%u ABORT (INT_STATUS=0x%08x ERR=0x%08x)\n",
+			ch, int_status, readl(pcie->dbi_base + 0x38005C));
+
+	if (int_status & ((1u << ch) | (1u << (ch + 16)))) {
+		writel((1u << ch) | (1u << (ch + 16)), pcie->dbi_base + 0x380058);
+		dmb(oshst);
+	}
 
 	spin_lock_irqsave(&chan->lock, flags);
 
@@ -636,17 +687,18 @@ static int miop_dma_try_reap(struct miop_pcie *pcie, u32 ch)
 		void (*save_cb)(u64, u64);
 		u32 save_status;
 
-		if (desc->status & 1)
-			break;
-
 		save_dma    = track->dma;
 		save_len    = track->len;
 		save_cookie = track->cookie;
 		save_cb     = track->cb;
 		save_status = desc->status;
 
-		memset(desc, 0, sizeof(*desc));
+		/* Do NOT zero desc->status: the engine re-fetches the ring from
+		 * its base on the next doorbell and walks the LLI chain, so the
+		 * descriptors must KEEP their Cycle Bit.  Only the software
+		 * tracking entry and busy marker are cleared. */
 		memset(track, 0, sizeof(*track));
+		chan->busy[idx] = 0;
 		chan->cons_idx = (idx + 1) & (MIOP_DMA_RING_SIZE - 1);
 
 		spin_unlock_irqrestore(&chan->lock, flags);
@@ -662,6 +714,13 @@ static int miop_dma_try_reap(struct miop_pcie *pcie, u32 ch)
 	}
 
 	spin_unlock_irqrestore(&chan->lock, flags);
+
+	/* Clear the done + abort interrupt bits for this channel.  The next
+	 * doorbell re-fetches the ring from its base; the descriptor Cycle
+	 * Bits (alternating 1/0/1/0...) let the engine walk to the new
+	 * terminator at prod_idx. */
+	writel((1u << ch) | (1u << (ch + 16)), pcie->dbi_base + 0x380058);
+	dmb(oshst);
 	return done;
 }
 
@@ -674,12 +733,23 @@ static int miop_raise_peer_irq(struct device *dev, u32 peer_id, u32 vector)
 {
 	struct miop_ep *ep = *(struct miop_ep **)((char *)dev + 0x78);
 	struct miop_pcie *pcie = ep->pcie_priv;
+	char __iomem *db;
 
-	if (!pcie->dbi_base)
+	if (!pcie || peer_id >= 4 || !pcie->peer_db_base[peer_id]) {
+		dev_info(pcie->dev, "raise_peer_irq peer=%u SKIP (base=%px)\n",
+			 peer_id, pcie ? pcie->peer_db_base[peer_id] : NULL);
 		return 0;
+	}
 
-	/* write vector to the doorbell register the RC monitors */
-	writel(vector, pcie->dbi_base + 0x200e00);
+	/* Write the doorbell vector into the *peer's* EP doorbell region (mapped
+	 * by map_peer_bar to the peer's DBI/ELBI window).  This produces an
+	 * inbound PCIe MemWr on the peer that asserts its RX doorbell interrupt.
+	 * Transcribed from pcie_asm.S miop_raise_peer_irq: writes to
+	 * peer_bar_base + peer_bar_phys. */
+	db = (char __iomem *)pcie->peer_db_base[peer_id] + pcie->peer_db_off[peer_id];
+	/* Doorbell value: bit[1]=RX-ready, bits[8:15]=source peer id
+	 * (factory rx_ep_interrupt decodes peer from db_val>>8). */
+	writel((vector & 0xff) | ((peer_id & 0xff) << 8), db);
 	return 0;
 }
 
@@ -688,11 +758,91 @@ static int miop_raise_peer_irq(struct device *dev, u32 peer_id, u32 vector)
  * doorbells from the RC, and reaps completed DMA descriptors.
  * Translated from pcie_asm.S line 1208.
  */
+/*
+ * miop_ep_handle_doorbell() - process a peer doorbell (db_val) and the eDMA
+ * completion status.  Shared by the GIC interrupt handler and the RX polling
+ * work: on the RK35 the EP interrupt output to the GIC is unreliable, so the
+ * factory uses a polling reap thread and we mirror that here.
+ *
+ * db_val layout (peer-written into our DBI doorbell @0x200e00):
+ *   bit[0]   peer online
+ *   bit[1]   RX ready  -> upper 16 bits are a local RX header pointer
+ *   bit[2]   TX ready
+ *   bit[3]   peer offline
+ *   bits[8:15]  peer id
+ */
+static void miop_ep_handle_doorbell(struct miop_pcie *pcie, u32 db_val)
+{
+	struct miop_ep *ep = pcie->ep;
+	struct miop_ep_net_driver *net = ep ? ep->net_drv : NULL;
+	u32 peer = (db_val >> 8) & 0xff;
+
+	if (net) {
+		if (db_val & 1)
+			net->on_peer_online(ep, peer);
+		if (db_val & 2) {
+			/* RX doorbell: upper 16 bits are the local RX header
+			 * pointer the peer wrote before ringing the bell. */
+			u32 hdr_addr = (db_val & 0xffff0000) |
+				       (db_val & 0xffff);
+			struct miop_rx_hdr *hdr =
+				(struct miop_rx_hdr *)(unsigned long)hdr_addr;
+			u32 len = 0;
+			void *buf = NULL;
+
+			if (hdr_addr) {
+				dev_info(pcie->dev, "RX db_val=0x%08x "
+					 "hdr@0x%08x buf=0x%llx len=%u\n",
+					 db_val, hdr_addr,
+					 (u64)hdr->buf_addr, hdr->len);
+				len = hdr->len;
+				buf = (void *)(unsigned long)hdr->buf_addr;
+			}
+			net->on_rx(ep, peer, buf, len);
+		}
+		if (db_val & 4)
+			net->on_tx_ready(ep, peer);
+		if (db_val & 8)
+			net->on_peer_offline(ep, peer);
+	}
+
+	miop_dma_try_reap(pcie, 0);
+	miop_dma_try_reap(pcie, 1);
+}
+
+/* Poll the local EP doorbell/APB status because the GIC interrupt (160) is not
+ * reliably delivered on this platform (TX works via INT_STATUS polling; RX
+ * depends on this).  Mirrors the factory's miop_dma_reap_thread.  We poll both
+ * the APB interrupt status AND the DBI doorbell register directly, because the
+ * inbound peer doorbell write may land in the DBI doorbell without the GIC
+ * being asserted. */
+static void miop_rx_poll_work_fn(struct work_struct *work)
+{
+	struct miop_pcie *pcie = container_of(work, struct miop_pcie,
+					      rx_poll_work.work);
+	u32 apb_st, db_val;
+
+	apb_st = readl(pcie->apb_base + 0x10);
+	db_val = rk35_pcie_readl_dbi(pcie->dbi_base, 0x200e00);
+
+	if (db_val && db_val != pcie->last_doorbell) {
+		pcie->last_doorbell = db_val;
+		dev_info(pcie->dev, "RXpoll apb_st=0x%08x db_val=0x%08x\n",
+			 apb_st, db_val);
+		miop_ep_handle_doorbell(pcie, db_val);
+		if (apb_st & (1u << 15))
+			writel(apb_st, pcie->apb_base + 0x10);
+		writel(0, pcie->dbi_base + 0x200e00);
+	} else if (!db_val) {
+		pcie->last_doorbell = 0;
+	}
+
+	schedule_delayed_work(&pcie->rx_poll_work, msecs_to_jiffies(2));
+}
+
 static irqreturn_t rk35_ep_interrupt(int irq, void *dev_id)
 {
 	struct miop_pcie *pcie = dev_id;
-	struct miop_ep *ep;
-	struct miop_ep_net_driver *net;
 	u32 apb_st;
 
 	if (!pcie || !pcie->apb_base)
@@ -704,35 +854,9 @@ static irqreturn_t rk35_ep_interrupt(int irq, void *dev_id)
 
 	if (apb_st & (1u << 15)) {
 		u32 db_val = rk35_pcie_readl_dbi(pcie->dbi_base, 0x200e00);
-		u32 peer = (db_val >> 8) & 0xff;
 
-		dev_info(pcie->dev, "IRQ doorbell db_val=0x%08x peer=%u\n",
-			 db_val, peer);
-
-		ep = pcie->ep;
-		net = ep ? ep->net_drv : NULL;
-
-		if (net) {
-			if (db_val & 1)
-				net->on_peer_online(ep, peer);
-			if (db_val & 2)
-				net->on_rx(ep, peer, NULL, 0);
-			if (db_val & 4)
-				net->on_tx_ready(ep, peer);
-			if (db_val & 8)
-				net->on_peer_offline(ep, peer);
-		}
-	}
-
-	{
-		int reaped = miop_dma_try_reap(pcie, 0);
-		if (reaped)
-			dev_info(pcie->dev, "IRQ reaped %d on ch0\n", reaped);
-	}
-	{
-		int reaped = miop_dma_try_reap(pcie, 1);
-		if (reaped)
-			dev_info(pcie->dev, "IRQ reaped %d on ch1\n", reaped);
+		dev_info(pcie->dev, "IRQ doorbell db_val=0x%08x\n", db_val);
+		miop_ep_handle_doorbell(pcie, db_val);
 	}
 
 	writel(apb_st, pcie->apb_base + 0x10);
@@ -762,20 +886,76 @@ static void miop_dma_list_commit_pending(struct device *dev)
 	 * doorbell; for the non-batch path this is a no-op. */
 }
 
-static int miop_elbi_enable_irq(struct device *dev, u32 irq_idx)
+/*
+ * miop_elbi_enable_irq() / _disable_irq() - transcribe pcie_asm.S:100-145.
+ *
+ * Enables an EP->GIC interrupt *source* in the DesignWare ELBI block.  The
+ * enable register group lives at DBI 0x838200 + group*4 (group = irq_idx>>4),
+ * 32 bits per group; bit (irq_idx & 0xf) in the UPPER 16 bits is the enable
+ * for that source.  Without this, an inbound peer doorbell write is absorbed
+ * by the EP and never forwarded to the GIC, so the RX (and TX-ready) doorbell
+ * interrupt never fires.
+ */
+static void miop_elbi_enable_irq(struct miop_pcie *pcie, u32 irq_idx)
 {
-	return 0;
+	void __iomem *reg;
+	u32 val;
+
+	if (!pcie->dbi_base2)
+		return;
+	reg = pcie->dbi_base2 + 0x838200 + ((irq_idx >> 4) << 2);
+	val = readl(reg);
+	val |= (1u << (irq_idx & 0xf)) << 16;
+	wmb();
+	writel(val, reg);
+	dev_info(pcie->dev, "ELBI enable irq_idx=%u reg=0x%lx val=0x%08x\n",
+		 irq_idx, (unsigned long)(0x838200 + ((irq_idx >> 4) << 2)),
+		 readl(reg));
 }
 
-static int miop_elbi_disable_irq(struct device *dev, u32 irq_idx)
+static void miop_elbi_disable_irq(struct miop_pcie *pcie, u32 irq_idx)
 {
-	return 0;
+	void __iomem *reg;
+	u32 val;
+
+	if (!pcie->dbi_base2)
+		return;
+	reg = pcie->dbi_base2 + 0x838200 + ((irq_idx >> 4) << 2);
+	val = readl(reg);
+	val &= ~((1u << (irq_idx & 0xf)) << 16);
+	wmb();
+	writel(val, reg);
 }
 
 static void *miop_rk35_map_peer_bar(struct device *dev, u32 peer,
 				    u64 phys, u32 size, u64 *out_phys)
 {
-	return NULL;
+	struct miop_ep *ep = *(struct miop_ep **)((char *)dev + 0x78);
+	struct miop_pcie *pcie = ep->pcie_priv;
+	void __iomem *va;
+
+	dev_info(dev, "map_peer_bar peer=%u phys=0x%llx size=0x%x\n",
+		 peer, (unsigned long long)phys, size);
+
+	if (peer >= 4 || !phys)
+		return NULL;
+
+	/* Map the peer's EP DBI/ELBI window so raise_peer_irq can write the
+	 * doorbell into it (transcribed from pcie_asm.S map_peer_bar /
+	 * miop_raise_peer_irq).  The net driver passes the peer's doorbell
+	 * window physical base; we ioremap it and remember it per-peer. */
+	va = ioremap(phys, size ? size : 0x1000000);
+	if (IS_ERR_OR_NULL(va))
+		return NULL;
+
+	dev_info(dev, "map_peer_bar GOT CALLED peer=%u phys=0x%llx size=0x%x va=%px\n",
+		 peer, (unsigned long long)phys, size, va);
+
+	pcie->peer_db_base[peer] = va;
+	pcie->peer_db_off[peer] = 0;
+	if (out_phys)
+		*out_phys = phys;
+	return va;
 }
 
 static void miop_rk35_unmap_peer_bar(struct device *dev, u32 peer)
@@ -802,13 +982,12 @@ static int miop_rk35_dma_submit_batch(struct device *dev, u32 ch,
 /*
  * miop_pcie_ep_probe() - RK35 EP bring-up, called by miop-ep.ko.
  *
- * Early/structural bring-up transcribed from pcie.S miop_pcie_ep_init:
- * allocate the pcie private, ioremap the DBI/APB windows, allocate the
- * outbound-window bitmaps from the EP window counts, and carve out the TX/DMA
- * coherent buffer. Link training, BAR setup, the outbound ATU mappings, IRQ
- * wiring and the peer handshake (which calls net_drv->on_peer_online) are
- * still to be wired in later passes; returning success here keeps the module
- * loadable so this structural setup can be verified without touching the link.
+ * Transcribed from pcie.S miop_pcie_ep_init: allocate the pcie private,
+ * ioremap the DBI/APB windows, allocate the outbound-window bitmaps from the
+ * EP window counts, carve out the TX/DMA coherent buffer, train the link, set
+ * up the BARs and outbound/inbound ATU mappings, wire the EP IRQ, and run the
+ * peer handshake (which calls net_drv->on_peer_online).  A deferred DMA
+ * self-test validates the DesignWare eDMA write engine.
  */
 static void miop_pcie_bar_check_work(struct work_struct *work)
 {
@@ -839,97 +1018,86 @@ static void miop_pcie_bar_check_work(struct work_struct *work)
 		u32 r;
 		int tries = 0;
 
+		/* --- DMA self-test: one write-descriptor to the peer ---------
+		 * Validates that the DesignWare eDMA write engine is correctly
+		 * programmed and can move a descriptor to completion.  Uses the
+		 * same LLI + Cycle Bit protocol as the production TX path. */
 		if (peer_addr > 0x100000000ULL && peer_addr < 0x10000000000ULL)
 			dest_addr = peer_addr;
 		else
-			dest_addr = 0x900030000ULL;
-
-		dev_info(dev, "DMA self-test: dest=0x%llx ring=0x%llx\n",
-			 dest_addr, (u64)pcie->chan[0].ring_dma);
+			dest_addr = 0x9000e0000ULL;
 
 		memset(d, 0, sizeof(*d));
 		d->len = 8;
 		d->addr_low = (u32)pcie->dma_dma;
 		d->addr_high = 0;
 		*(u64 *)((char *)d + 16) = dest_addr;
+		memset((char *)d + 24, 0, 24);  /* CB=0 terminator */
 		wmb();
-		d->status = 1;
+		d->status = 0x9;  /* CB=1 | LIE */
 		wmb();
 
-		/* Producer index to trailer */
 		*(u32 *)((char *)d +
 			 MIOP_DMA_RING_SIZE * sizeof(struct miop_dma_desc)
 			 + 4) = 1;
 		wmb();
 
-		/*** Interrupt-handler init sequence (pcie_asm.S:1360-1483) ***/
+		/* Interrupt-handler init sequence (pcie_asm.S:1360-1483) */
 		writel(1, pcie->dbi_base + 0x38000C);
-
 		r = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
 		writel(r & ~3u, pcie->dbi_base + 0x380054);
-
 		r = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380090);
 		writel(r | 0x30000, pcie->dbi_base + 0x380090);
-
 		writel(0x40000308, pcie->dbi_base + 0x380200);
 		writel(0,          pcie->dbi_base + 0x380204);
-		writel((u32)pcie->chan[0].ring_dma,
-		       pcie->dbi_base + 0x38021C);
+		writel((u32)pcie->chan[0].ring_dma, pcie->dbi_base + 0x38021C);
 		writel((u32)(pcie->chan[0].ring_dma >> 32),
 		       pcie->dbi_base + 0x380220);
-
 		writel(0x40000308, pcie->dbi_base + 0x380400);
 		writel(0,          pcie->dbi_base + 0x380404);
-		writel((u32)pcie->chan[0].ring_dma,
-		       pcie->dbi_base + 0x38041C);
+		writel((u32)pcie->chan[0].ring_dma, pcie->dbi_base + 0x38041C);
 		writel((u32)(pcie->chan[0].ring_dma >> 32),
 		       pcie->dbi_base + 0x380420);
-
 		writel(1, pcie->dbi_base + 0x38002C);
-
 		writel(0x40000308, pcie->dbi_base + 0x380300);
 		writel(0,          pcie->dbi_base + 0x380304);
-		writel((u32)pcie->chan[0].ring_dma,
-		       pcie->dbi_base + 0x38031C);
+		writel((u32)pcie->chan[0].ring_dma, pcie->dbi_base + 0x38031C);
 		writel((u32)(pcie->chan[0].ring_dma >> 32),
 		       pcie->dbi_base + 0x380320);
-
 		r = rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800A8);
 		writel(r & ~1u, pcie->dbi_base + 0x3800A8);
-
 		r = rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800C4);
 		writel(r | 0x10000, pcie->dbi_base + 0x3800C4);
 		dmb(oshst);
 
 		writel(0x10001, pcie->dbi_base + 0x380058);
 		dmb(oshst);
+		rk35_dma_start_write(pcie, 0);
 
-		writel(1, pcie->dbi_base + 0x380010);
-		dmb(oshst);
-
-		r = readl(pcie->dbi_base + 0x38000C);
-		dev_info(dev, "DMA self-test: after init 0x38000C=0x%08x "
-			 "0x380010=0x%08x 0x3800A8=0x%08x "
-			 "0x3800C4=0x%08x\n", r,
-			 readl(pcie->dbi_base + 0x380010),
-			 readl(pcie->dbi_base + 0x3800A8),
-			 readl(pcie->dbi_base + 0x3800C4));
-
-		while (tries < 10000 && (d->status & 1)) {
+		/* Poll INT_STATUS (the real completion signal) */
+		tries = 0;
+		while (tries < 100 &&
+		       !(readl(pcie->dbi_base + 0x38004C) & 1)) {
 			udelay(100);
 			tries++;
 		}
-		dev_info(dev, "DMA self-test: status=%u after %dms "
-			 "0x38000C=0x%08x 0x38004C=0x%08x "
-			 "0x380010=0x%08x 0x380090=0x%08x\n",
-			 d->status, tries * 100 / 1000,
-			 readl(pcie->dbi_base + 0x38000C),
-			 readl(pcie->dbi_base + 0x38004C),
-			 readl(pcie->dbi_base + 0x380010),
-			 readl(pcie->dbi_base + 0x380090));
 
-		d->status = 0;
-		wmb();
+		if (readl(pcie->dbi_base + 0x38004C) & 1) {
+			dev_info(dev, "DMA self-test: PASS (INT=0x%08x)\n",
+				 readl(pcie->dbi_base + 0x38004C));
+			writel(1, pcie->dbi_base + 0x380058);
+			dmb(oshst);
+		} else {
+			dev_err(dev, "DMA self-test: FAIL (INT=0x%08x ERR=0x%08x)\n",
+				readl(pcie->dbi_base + 0x38004C),
+				readl(pcie->dbi_base + 0x38005C));
+		}
+
+		/* Self-test consumed channel 0; reset the ring tracking so the
+		 * net driver starts with a clean, positional CB pattern. */
+		pcie->chan[0].prod_idx = 0;
+		pcie->chan[0].cons_idx = 0;
+		memset(pcie->chan[0].busy, 0, sizeof(pcie->chan[0].busy));
 	}
 }
 
@@ -939,6 +1107,7 @@ static int miop_pcie_ep_probe(struct device *dev)
 	struct miop_ep *ep = platform_get_drvdata(pdev);
 	struct miop_pcie *pcie;
 	void __iomem *dbi_base, *apb_base;
+	int i;
 	dma_addr_t dma_dma;
 	void *dma_buf;
 
@@ -960,8 +1129,16 @@ static int miop_pcie_ep_probe(struct device *dev)
 		return PTR_ERR(dbi_base);
 	}
 	pcie->dbi_base = dbi_base;
-	pcie->dbi_base2 = (char __iomem *)dbi_base + 0x100000;
 	pcie->atu_base = (char __iomem *)dbi_base + 0x300000;
+
+	/* The factory's ELBI block (DBI 0x838200) lives outside the 4 MiB DBI
+	 * window, in the 8 MiB DBI2 window @0xa40800000 (devicetree
+	 * fe170000.pcie pcie-dbi).  Map it separately for ELBI access. */
+	pcie->dbi_base2 = devm_ioremap(dev, 0xa40800000ULL, 0x800000);
+	if (IS_ERR_OR_NULL(pcie->dbi_base2)) {
+		dev_warn(dev, "ioremap DBI2 failed, ELBI disabled\n");
+		pcie->dbi_base2 = NULL;
+	}
 
 	apb_base = devm_ioremap_resource(dev, ep->hw.res_apb);
 	if (IS_ERR(apb_base)) {
@@ -1017,6 +1194,7 @@ static int miop_pcie_ep_probe(struct device *dev)
 				i * MIOP_DMA_RING_STRIDE;
 			ch->prod_idx = 0;
 			ch->cons_idx = 0;
+			memset(ch->busy, 0, sizeof(ch->busy));
 			spin_lock_init(&ch->lock);
 
 			/* Write ring bus address into trailer at +8 */
@@ -1074,6 +1252,50 @@ static int miop_pcie_ep_probe(struct device *dev)
 		u32 st = readl(pcie->apb_base + 0x10);
 		if (st)
 			writel(st, pcie->apb_base + 0x10);
+	}
+
+	/* Discover the factory's ELBI base (ep_drv+8) to confirm which window
+	 * 0x838200 lives in.  ep->pcie_ep_drv is the factory pcie_ep_drv
+	 * pointer; *(u64*)(ep->pcie_ep_drv + 8) is the base the assembly uses. */
+	{
+		void *drv = ep->pcie_ep_drv;
+		u64 drv_base = drv ? *(u64 *)((char *)drv + 8) : 0;
+
+		dev_info(dev, "ELBI discover: dbi_base=%px dbi_base2=%px "
+			 "apb_base=%px drv_base(ep_drv+8)=0x%llx\n",
+			 pcie->dbi_base, pcie->dbi_base2, pcie->apb_base,
+			 (unsigned long long)drv_base);
+	}
+
+	/* Enable the EP->GIC interrupt sources in the ELBI block.  This is what
+	 * forwards an inbound peer doorbell write to the GIC; without it the RX
+	 * (and TX-ready) doorbell interrupt never fires.  The doorbell sources
+	 * are in the low ELBI groups; enable a generous range to cover all
+	 * peer/source combinations (pcie_asm.S miop_elbi_enable_irq). */
+	for (i = 0; i < 16; i++)
+		miop_elbi_enable_irq(pcie, i);
+
+	/* Map each peer's RX doorbell window.  The peer EP doorbell target
+	 * (where we write to assert the peer's RX doorbell) follows the pattern
+	 * of node1's factory PEER_DESC/ELBI table: base 0x900020000, stride
+	 * 0x40000 per peer (per node1 factory log PEER_ELBI/PEER_DESC).  Writing
+	 * our vector there produces an inbound PCIe MemWr on the peer that
+	 * asserts its RX doorbell IRQ.  Our net driver does not call
+	 * map_peer_bar, so map these here. */
+	for (i = 0; i < 4; i++) {
+		u64 elbi_pa = 0x900020000ULL + (u64)i * 0x40000ULL;
+
+		pcie->peer_db_base[i] = ioremap(elbi_pa, 0x1000);
+		if (IS_ERR_OR_NULL(pcie->peer_db_base[i])) {
+			dev_warn(dev, "ioremap peer%d doorbell 0x%llx failed\n",
+				 i, (unsigned long long)elbi_pa);
+			pcie->peer_db_base[i] = NULL;
+		} else {
+			pcie->peer_db_off[i] = 0;
+			dev_info(dev, "mapped peer%d doorbell @0x%llx -> %px\n",
+				 i, (unsigned long long)elbi_pa,
+				 pcie->peer_db_base[i]);
+		}
 	}
 
 	/* Request EP IRQ BEFORE the second APB write + link training poll,
@@ -1163,9 +1385,32 @@ static int miop_pcie_ep_probe(struct device *dev)
 
 	dev_info(dev, "DMA engine init OK (self-test deferred to 35s work)\n");
 
+	g_pcie = pcie;
+
 	INIT_DELAYED_WORK(&pcie->bar_check_work, miop_pcie_bar_check_work);
 	schedule_delayed_work(&pcie->bar_check_work, 35 * HZ);
 
+	INIT_DELAYED_WORK(&pcie->rx_poll_work, miop_rx_poll_work_fn);
+	schedule_delayed_work(&pcie->rx_poll_work, msecs_to_jiffies(50));
+
+	return 0;
+}
+
+static int miop_elbi_enable_irq_dev(struct device *dev, u32 irq_idx)
+{
+	struct miop_ep *ep = *(struct miop_ep **)((char *)dev + 0x78);
+	struct miop_pcie *pcie = ep->pcie_priv;
+
+	miop_elbi_enable_irq(pcie, irq_idx);
+	return 0;
+}
+
+static int miop_elbi_disable_irq_dev(struct device *dev, u32 irq_idx)
+{
+	struct miop_ep *ep = *(struct miop_ep **)((char *)dev + 0x78);
+	struct miop_pcie *pcie = ep->pcie_priv;
+
+	miop_elbi_disable_irq(pcie, irq_idx);
 	return 0;
 }
 
@@ -1173,8 +1418,8 @@ static struct miop_pcie_ep_driver miop_pcie_driver = {
 	.init                = miop_pcie_ep_probe,
 	.deinit              = NULL,
 	.machine_id          = miop_ep_machine_id,
-	.elbi_enable_irq     = miop_elbi_enable_irq,
-	.elbi_disable_irq    = miop_elbi_disable_irq,
+	.elbi_enable_irq     = miop_elbi_enable_irq_dev,
+	.elbi_disable_irq    = miop_elbi_disable_irq_dev,
 	.raise_peer_irq      = miop_raise_peer_irq,
 	.dma_list_is_full    = miop_dma_list_is_full,
 	.dma_list_commit_pending = miop_dma_list_commit_pending,
@@ -1186,22 +1431,58 @@ static struct miop_pcie_ep_driver miop_pcie_driver = {
 	.dma_submit_batch    = miop_rk35_dma_submit_batch,
 };
 
-/* ---- module init/exit: publish the driver struct ---------------- */
+/* ---- debugfs raw register poke (for bringing up the doorbell target) ---- */
+static ssize_t miop_dbg_write(struct file *file, const char __user *ubuf,
+			      size_t count, loff_t *off)
+{
+	char buf[64];
+	u64 addr, val;
+	void __iomem *va;
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = 0;
+	if (sscanf(buf, "%llx %llx", &addr, &val) != 2)
+		return -EINVAL;
+
+	va = ioremap(addr, 4);
+	if (IS_ERR_OR_NULL(va))
+		return -ENOMEM;
+	writel((u32)val, va);
+	iounmap(va);
+	pr_info("miop dbg: wrote 0x%llx -> 0x%llx\n", val, addr);
+	return count;
+}
+
+static const struct file_operations miop_dbg_fops = {
+	.owner = THIS_MODULE,
+	.write = miop_dbg_write,
+};
+
+static struct dentry *miop_dbg_dir;
+
 static int __init miop_pcie_ep_module_init(void)
 {
 	printk(KERN_INFO "Mixtile TCP/IP over PCIe RK35 EP driver\n");
 	miop_register_pcie_ep_drv(&miop_pcie_driver);
+	miop_dbg_dir = debugfs_create_dir("miop", NULL);
+	if (miop_dbg_dir)
+		debugfs_create_file("poke", 0200, miop_dbg_dir, NULL,
+				    &miop_dbg_fops);
 	return 0;
 }
 
 static void __exit miop_pcie_ep_module_exit(void)
 {
+	if (g_pcie)
+		cancel_delayed_work_sync(&g_pcie->rx_poll_work);
+	if (miop_dbg_dir)
+		debugfs_remove_recursive(miop_dbg_dir);
 	/* miop_register_pcie_ep_drv(NULL) retrieves (does not clear) the stored
 	 * pointer; there is no "unregister" primitive in the registry, so just
 	 * announce teardown. miop-ep.ko is not re-probed on unload in practice. */
 	miop_register_pcie_ep_drv(NULL);
 	printk(KERN_INFO "Mixtile TCP/IP over PCIe RK35 EP driver exit\n");
 }
-
-module_init(miop_pcie_ep_module_init);
-module_exit(miop_pcie_ep_module_exit);

@@ -97,6 +97,8 @@ int miop_register_is_ready(void)
 	if (miop_reg.pcie_ep_drv && miop_reg.ep_net_drv)
 		ready = 1;
 	mutex_unlock(&miop_reg_lock);
+	printk(KERN_INFO "miop is_ready=%d pcie_ep_drv=%d ep_net_drv=%d\n",
+	       ready, !!miop_reg.pcie_ep_drv, !!miop_reg.ep_net_drv);
 	return ready;
 }
 EXPORT_SYMBOL(miop_register_is_ready);
