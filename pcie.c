@@ -515,9 +515,8 @@ static void rk35_dma_start_write(struct miop_pcie *pcie, u32 ch)
 	writel((1u << ch) | (1u << (16 + ch)), pcie->dbi_base + 0x380058);
 	dmb(oshst);
 
-	/* 6. Doorbell — matches rk35_dma_start_write in factory */
-	v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
-	writel((v & ~7) | ch, pcie->dbi_base + 0x380010);
+	/* 6. Doorbell — write 1<<ch to trigger the channel */
+	writel(1u << ch, pcie->dbi_base + 0x380010);
 }
 
 static void rk35_dma_start_write(struct miop_pcie *pcie, u32 ch);
@@ -905,8 +904,7 @@ static void miop_pcie_bar_check_work(struct work_struct *work)
 		writel(0x10001, pcie->dbi_base + 0x380058);
 		dmb(oshst);
 
-		r = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
-		writel((r & ~7) | 0, pcie->dbi_base + 0x380010);
+		writel(1, pcie->dbi_base + 0x380010);
 		dmb(oshst);
 
 		r = readl(pcie->dbi_base + 0x38000C);
