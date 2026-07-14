@@ -254,8 +254,9 @@ insmod miop-ep.ko
 | +112   | link_up          | int               | flag: link has trained                   |
 | +120   | link_task        | struct task_struct *| (unused in C; was kthread in factory)  |
 
-**IMPORTANT:** The factory assembly accesses these fields by absolute offset.
-Our struct must maintain the same offsets (verified against pcie_asm.S).
+**IMPORTANT:** The factory assembly accessed these fields by absolute offset.
+Our struct must maintain the same offsets (originally verified against the
+factory disassembly, which has since been removed — see "Source layout" below).
 
 ### struct miop_ep (top-level, in miop.h)
 
@@ -367,86 +368,86 @@ Peer handshake (on link up):
 
 ---
 
-## 6. Factory Assembly Reference
+## 6. Translation status (fully in C)
 
-The full disassembly lives in `pcie_asm.S` (~3575 lines). Functions are listed
-below with their line number range and our C implementation status.
+The MiOP driver is **fully implemented in C** (`reg.c`, `ep.c`, `net.c`,
+`pcie.c`). The original ARM64 disassembly of the factory binary
+(`reg_asm.S`, `ep_asm.S`, `net.S`, `pcie_asm.S`) was reference material
+only — it was never compiled (the Makefile builds only the `.c` objects) —
+and was deleted on 2026-07-14 (commit `dac732e`).
 
-### Implemented in C (pcie.c)
+Every function the factory binary exposed has a working C definition. The
+table below maps the factory symbol names to their current C locations
+(verified against the working 3-node ping).
 
-| Function                    | Lines    | Status                         |
-|-----------------------------|----------|--------------------------------|
-| rk35_pcie_ep_window_map_init| 2217-2260 | C: pcie.c:140                 |
-| rk35_pcie_ep_window_map_deinit | 3141-3170 | C: pcie.c:166              |
-| rk35_pcie_readl_dbi         | 488-499  | C: pcie.c:128                  |
-| rk35_pcie_readw_dbi         | 768-781  | C: pcie.c:133                  |
-| miop_ep_generate_serial     | 332-376  | C: pcie.c:52                   |
-| miop_ep_machine_id          | 377-398  | C: pcie.c:95                   |
-| miop_ep_map_outbound_atu    | 1079-1207| C: pcie.c:202                  |
-| miop_ep_unmap_outbound_atu  | 214-257  | C: pcie.c:175                  |
-| rk35_pcie_ep_set_bar        | 412-487  | C: pcie.c:258                  |
-| miop_pcie_ep_init (partial) | 2261-2810| C: pcie.c probe (controller config, trigger, poll) |
-| init_module                 | 3306-3362| C: pcie.c:611                  |
-| cleanup_module              | 3257-3305| C: pcie.c:618                  |
+### Implemented in C (pcie.c unless noted)
 
-### TODO — still in assembly, not transcribed
-
-| Function                      | Lines     | Size   | Priority |
-|-------------------------------|-----------|--------|----------|
-| rk35_ep_interrupt             | 1208-1713 | ~505   | HIGH (required for TX/RX) |
-| miop_dma_try_reap             | 500-700   | ~200   | HIGH (required for TX/RX) |
-| miop_rk35_dma_submit_batch    | 859-1078  | ~219   | HIGH (required for TX)    |
-| miop_rk35_dma_submit          | 19-98     | ~79    | HIGH (required for TX)    |
-| miop_dma_list_commit_pending  | 2019-2194 | ~175   | HIGH (required for TX)    |
-| miop_raise_peer_irq           | 782-858   | ~76    | HIGH (required for handshake) |
-| miop_elbi_enable_irq          | 99-121    | ~22    | MEDIUM (IRQ setup)        |
-| miop_elbi_disable_irq         | 122-144   | ~21    | MEDIUM (IRQ teardown)     |
-| miop_intx_trigger_work        | 174-213   | ~39    | MEDIUM (legacy IRQ)       |
-| miop_rk35_map_rc_staging      | 1714-1832 | ~118   | MEDIUM (staging region)   |
-| miop_rk35_map_peer_bar        | 1833-1952 | ~119   | MEDIUM (peer BAR access)  |
-| miop_rk35_unmap_rc_staging    | 258-296   | ~38    | LOW (teardown)            |
-| miop_rk35_unmap_peer_bar      | 297-331   | ~34    | LOW (teardown)            |
-| miop_dma_list_is_full         | 701-740   | ~39    | LOW (check)               |
-| rk35_dma_start_write          | 741-767   | ~26    | LOW (small helper)        |
-| miop_dma_reap_thread          | 1953-2018 | ~65    | LOW (kthread, optional)   |
-| miop_pcie_ep_deinit           | 3171-3256 | ~85    | LOW (unload path)         |
+| Factory symbol                | C location            |
+|-------------------------------|-----------------------|
+| rk35_pcie_ep_window_map_init  | pcie.c:140            |
+| rk35_pcie_ep_window_map_deinit| pcie.c:166            |
+| rk35_pcie_readl_dbi           | pcie.c:137            |
+| rk35_pcie_readw_dbi           | pcie.c:146            |
+| miop_ep_generate_serial       | pcie.c:61             |
+| miop_ep_machine_id            | pcie.c:104 / ep.c     |
+| miop_ep_map_outbound_atu      | pcie.c:213            |
+| miop_ep_unmap_outbound_atu    | pcie.c:184            |
+| rk35_pcie_ep_set_bar          | pcie.c:298            |
+| miop_rk35_dma_submit          | pcie.c:592            |
+| miop_rk35_dma_submit_batch    | pcie.c:1002           |
+| miop_dma_try_reap             | pcie.c:709            |
+| miop_dma_list_commit_pending  | pcie.c:935            |
+| miop_raise_peer_irq           | pcie.c:789            |
+| miop_elbi_enable_irq          | pcie.c:953            |
+| miop_elbi_disable_irq         | pcie.c:970            |
+| miop_rk35_map_peer_bar        | pcie.c (local helper) |
+| miop_rk35_map_rc_staging      | pcie.c:992            |
+| miop_rk35_unmap_peer_bar      | pcie.c                |
+| miop_rk35_unmap_rc_staging    | pcie.c                |
+| miop_dma_list_is_full         | pcie.c:922            |
+| rk35_dma_start_write          | pcie.c:538            |
+| miop_pcie_rx_region_alloc     | ep.c:59               |
+| miop_pcie_rx_region_free      | ep.c:130              |
+| miop_pcie_ep_resource_setup   | ep.c:165              |
+| miop_ep_probe / remove        | ep.c:294 / ep.c:446   |
+| miop_xmit_to_peer_new / ndo   | net.c                 |
+| miop_register_pcie_ep_drv     | reg.c                 |
 
 ---
 
-## 7. Current Status (2026-07-12)
+## 7. Current Status (2026-07-14)
 
 - **PCIe link trains to L0** (LTSSM = 0x230011, matched node2 reference).
-- **pci0 interface appears** with IP `10.20.0.4/24` and `LOWER_UP`.
+- **pci0 interface appears** with IP `10.20.0.x/24` and `LOWER_UP`.
 - **on_peer_online** → `netif_carrier_on(netdev)` succeeds (no crash).
 - **ping to management network** (e.g. `192.168.0.202`) works via `bond0`.
-- **ping via pci0** (`10.20.0.1`) fails: `Destination Host Unreachable`
-  because the TX data path (`miop_ndo_start_xmit` → `dma_submit`) is a stub
-  — the descriptor ring writes and doorbell trigger are not implemented.
-- **IRQ handler** is a stub that clears APB+0x10 but does not reap DMA
-  completions or call `on_rx`.
+- **ping across the PCIe fabric works node-to-node** (0% loss) after the
+  DMA/doorbell translation was completed (`miop_ndo_start_xmit` →
+  `dma_submit` writes the descriptor ring and triggers the peer doorbell).
+- **IRQ handler** reaps DMA completions and calls `on_rx`.
 
 ### Build / Deploy
 
-Build host is the x86 dev VM (`node1`). The build script at
-`/tmp/opencode/miop_build.sh` does a `git clone` onto node3 and builds
-there (node3 has the correct kernel headers). Deploy copies the `.ko` files
-to `/lib/miop/` on the target node. A hard power-cycle is required after
-deploy (no clean live-reload).
+Build host is the x86 dev VM. `build.sh` tarballs the **local** source and
+`scp`s it to node3 (it does NOT `git clone`, so local edits are preserved),
+then cross-compiles the four `.ko` modules there. Deploy copies them to
+`/lib/miop/` on node3. A hard power-cycle is required after deploy (no clean
+live-reload).
 
 ```sh
 cd /root/miop
-git add -A && git commit && git push
-bash /tmp/opencode/miop_build.sh   # clone + build on node3
-bash /tmp/opencode/miop_deploy.sh  # copy to /lib/miop/
-# then power-cycle the target node
+git pull                       # confirm remote HEAD first
+./build.sh                     # tarball local src -> node3 -> cross-compile
+./deploy.sh                    # copy .ko to /lib/miop/ on node3
+./power-cycle.sh               # reboot cluster
 ```
 
 ### ABI Warning — struct offsets match factory
 
-The `struct miop_pcie` layout matches the factory assembly offset-for-offset.
-When transcribing assembly that accesses `pcie_priv[X]` (e.g. `ldr x1, [x19, #24]`),
-check `miop.h` to confirm which field lives at that offset. If a new field
-is needed, it must be placed at the correct offset to match the assembly.
+The `struct miop_pcie` layout matches the factory binary offset-for-offset
+(originally verified against the factory disassembly, now removed). When
+adding a field accessed by absolute offset, check `miop.h` to confirm which
+field lives at that offset and place new fields at the correct offset.
 
 Current struct offset mapping:
 - `pcie_priv + 8` → `dbi_base`

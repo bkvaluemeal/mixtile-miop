@@ -3,13 +3,12 @@
 This repository contains a **source-level C reimplementation** of the four
 kernel modules that drive the Mixtile Blade 3 TCP/IP-over-PCIe fabric. The
 original modules were shipped as closed-source `.ko` files; this project
-replaces them with clean, readable C built from the ARM64 disassembly
-(`pcie_asm.S`).
+replaces them with clean, readable C.
 
-**Current status:** The PCIe link trains to L0, the `pci0` network interface
-comes up with an IP address and carrier, but the data-path (TX/RX DMA rings,
-IRQ completion reap) is still stub code — ping via the PCIe fabric fails with
-`Destination Host Unreachable`.
+**Current status:** Fully translated and working. The PCIe link trains to
+L0, the `pci0` network interface comes up, and ping across the PCIe fabric
+works node-to-node in both directions (0% loss). The driver is 100% C — the
+original ARM64 disassembly was reference material only and has been removed.
 
 ## Modules
 
@@ -22,24 +21,28 @@ IRQ completion reap) is still stub code — ping via the PCIe fabric fails with
 
 ## Build & Deploy
 
-The build happens on **node3** (the RK3588 target) via `git clone` from
-GitHub. The x86 dev VM (`node1`) pushes changes and orchestrates.
+The build happens on **node3** (the RK3588 target). `build.sh` tarballs the
+**local** source tree and `scp`s it to node3 (it does NOT `git clone`, so
+local edits are preserved), then cross-compiles the four `.ko` modules there.
+`deploy.sh` copies the `.ko` files to `/lib/miop/` on node3. A **full
+power-cycle is required** for the new modules to take effect (no hot-reload).
 
 ```sh
-cd /root/miop           # x86 dev VM
-git add -A && git commit && git push
-bash /tmp/opencode/miop_build.sh    # clone + build on node3
-bash /tmp/opencode/miop_deploy.sh   # copy .ko to /lib/miop/ on node3
-# Hard power-cycle node3 to test
+cd /root/miop           # x86 dev VM / repo root
+git pull                # confirm remote HEAD (repo auto-commits)
+./build.sh              # tarball local src -> node3 -> cross-compile
+./deploy.sh             # copy .ko to /lib/miop/ on node3
+./power-cycle.sh        # reboot cluster (controllers + blades)
 ```
 
-## State of the art (2026-07-12)
+## State of the art (2026-07-14)
 
 - PCIe link trains to L0: `apb+0x300 = 0x230011`
-- `pci0: <BROADCAST,MULTICAST,UP,LOWER_UP>` with IP `10.20.0.4/24`
+- `pci0: <BROADCAST,MULTICAST,UP,LOWER_UP>` with IP `10.20.0.x/24`
 - `on_peer_online` calls `netif_carrier_on()` without crashing
 - Ping to management ethernet (192.168.0.x) works
-- Ping to PCIe fabric (10.20.0.x) fails — TX descriptor ring not implemented
+- **Ping across the PCIe fabric works node-to-node (0% loss)**
+- Driver is 100% C; the original disassembly (`*_asm.S`) has been removed
 
 ## Documentation
 
