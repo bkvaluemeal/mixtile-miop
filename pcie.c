@@ -1018,7 +1018,6 @@ static int miop_pcie_ep_probe(struct device *dev)
 
 	/* DMA self-test: try multiple direct-mode approaches */
 	{
-		u32 tries, db_val;
 		u32 results[10];
 
 		dev_info(dev, "DMA self-test BEGIN\n");
