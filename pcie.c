@@ -1022,7 +1022,7 @@ static int miop_pcie_ep_probe(struct device *dev)
 	/* DMA self-test: minimal direct-mode write to verify engine works */
 	{
 		int tries;
-		u32 doorbell_sta, doorbell_db;
+		u32 doorbell_sta, doorbell_db, v;
 
 		dev_info(dev, "DMA self-test BEGIN (%d channels)\n", pcie->num_chan);
 
