@@ -412,6 +412,33 @@ static void miop_pcie_config_controller(struct miop_pcie *pcie,
 }
 
 /*
+ * miop_pcie_peer_online() - drive the peer/link handshake once the link is up.
+ * Transcribed in spirit from the link-up branch of pcie.S rk35_ep_interrupt:
+ * the vendor discovers the peer BAR target via the MIOP shared-header exchange
+ * and programs an outbound iATU window, then calls net_drv->on_peer_online()
+ * (which in miop-ep-net.ko flips pci0's carrier and sets up the TX/RX rings).
+ *
+ * The exact MIOP header exchange / per-peer descriptor-ring plumbing
+ * (pcie.S fields +280/+600/+9024/+17352) is pending protocol fidelity, so for
+ * this pass we notify the net layer with peer=0 (its on_peer_online is a safe
+ * stub). This is driven from the reliable link-up poll rather than the IRQ.
+ */
+static void miop_pcie_peer_online(struct miop_pcie *pcie)
+{
+	struct miop_ep *ep = pcie->ep;
+	struct miop_ep_net_driver *net = ep->net_drv;
+	int ret;
+
+	if (!net || !net->on_peer_online)
+		return;
+	/* TODO: target = peer BAR base from MIOP header; then
+	 * miop_ep_map_outbound_atu(pcie, target, size, extra). */
+	ret = net->on_peer_online(ep, 0);
+	dev_info(pcie->dev,
+		 "peer online -> net_drv->on_peer_online(peer=0) = %d\n", ret);
+}
+
+/*
  * miop_pcie_link_train() - bounded LTSSM link-training poll, transcribed from
  * pcie.S (apb_base+0x300 link-status register). Bounded to LINK_TRAIN_ITERS so
  * a missing peer can never hang boot; returns 0 if link came up, -ETIMEDOUT
@@ -431,6 +458,7 @@ static int miop_pcie_link_train(struct miop_pcie *pcie)
 		if ((st & mask) == want) {
 			pcie->link_up = 1;
 			dev_info(pcie->dev, "PCIe Link up (status %#x)\n", st);
+			miop_pcie_peer_online(pcie);
 			return 0;
 		}
 		msleep(20);

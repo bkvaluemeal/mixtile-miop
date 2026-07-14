@@ -81,7 +81,7 @@ verifiable increment):
 12. `ioremap` ×2 — RC staging + peer BAR mapping (`miop_rk35_map_rc_staging`, `miop_rk35_map_peer_bar`). **STUBBED**.
 13. outbound ATU: `miop_ep_map_outbound_atu` (`outbound free_win` messages).
     Helpers exist; not yet driven by the link-up path.
-14. peer handshake → calls `net_drv->on_peer_online()` → `Node online` / `tx staging` / `new-arch init`. **STUBBED** (lives in `rk35_ep_interrupt`, not wired).
+14. peer handshake → calls `net_drv->on_peer_online()` → `Node online` / `tx staging` / `new-arch init`. **PARTIALLY WIRED**: on link-up (detected by the bounded poll) `miop_pcie_peer_online()` now calls `net_drv->on_peer_online(ep, 0)`. The exact MIOP shared-header exchange and per-peer descriptor-ring plumbing (pcie.S fields +280/+600/+9024/+17352) — and the outbound ATU mapping to the discovered peer BAR target — are still TODO, so the call currently passes peer=0 (net layer's `on_peer_online` is a safe stub).
 
 **Key runtime finding (2026-07-12):** `fe150000.pcie` is bound to **our**
 `miop-ep` driver and there is **no** kernel PCIe EP framework in use
