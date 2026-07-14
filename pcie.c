@@ -552,6 +552,8 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 	dev_info(pcie->dev, "dma_submit ch=%u prod=%u len=%u dma=%llx desc[%u].status=%u\n",
 		 ch, chan->prod_idx, len, data, idx, desc->status);
 	rk35_dma_start_write(pcie, ch);
+	if (miop_dma_try_reap(pcie, ch))
+		dev_info(pcie->dev, "try_reap after submit: reaped on ch%u\n", ch);
 	return 0;
 }
 
