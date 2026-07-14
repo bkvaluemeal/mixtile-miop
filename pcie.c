@@ -988,8 +988,6 @@ static int miop_pcie_ep_probe(struct device *dev)
 		writel(v & ~1u, pcie->dbi_base + 0x3800A8);
 		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800C4);
 		writel(v | 0x10000, pcie->dbi_base + 0x3800C4);
-		for (i = 0; i < MIOP_DMA_NUM_CH; i++)
-			writel(0x10001 << i, pcie->dbi_base + 0x380058);
 
 		/* APB master interrupt gate — verify writable */
 		writel(0x80000000, pcie->apb_base + 0x24);
@@ -1026,6 +1024,15 @@ static int miop_pcie_ep_probe(struct device *dev)
 		struct miop_dma_desc *d = pcie->chan[0].ring;
 		u32 v, r;
 		int tries = 0;
+
+		/* Set up outbound ATU for the DMA buffer so the write engine
+		 * can translate local → PCIe bus address.  Map 1 MiB at
+		 * dma_dma (0x0e000000) to a PCIe address in the peer BAR
+		 * window (0x06000000).  This is a minimal mapping; the real
+		 * net driver uses a different staging region. */
+		rk35_pcie_readl_dbi(pcie->dbi_base, 0x300000 + 0x00C);
+		writel(0x0e000000, pcie->dbi_base + 0x380000 + 0x100);
+		dmb(oshst);
 
 		memset(d, 0, sizeof(*d));
 		d->len = 8;
