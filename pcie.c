@@ -1325,9 +1325,14 @@ static int miop_pcie_ep_probe(struct device *dev)
 		u64 out_phys = 0;
 		void *va;
 		u64 db_pa, data_pa;
-		u64 target = 0x90000000ULL + ((u64)i << 25);
+		/* Peer p listens for RX data at 0x90000000 + (p<<24) + (SRC<<20),
+		 * where SRC is THIS node's id (3).  Verified by the working 2-node
+		 * link: node1(src=1)->node2 uses 0x903000000, node2(src=2)->node1
+		 * uses 0x901000000.  So node3(src=3)->node1 = 0x903000000,
+		 * node3->node2 = 0x902000000. */
+		u64 target = 0x90000000ULL + ((u64)i << 24) + (3ULL << 20);
 
-		va = miop_map_peer_bar(pcie, target, 0x1000000, &out_phys);
+		va = miop_map_peer_bar(pcie, target, 0x3000000, &out_phys);
 		if (!va) {
 			dev_warn(dev, "map_peer_bar peer=%d failed\n", i);
 			pcie->peer_db_base[i] = NULL;
@@ -1336,11 +1341,11 @@ static int miop_pcie_ep_probe(struct device *dev)
 			continue;
 		}
 		db_pa   = out_phys + 0x20;
-		data_pa = out_phys + 0x100000;
+		data_pa = out_phys + 0x2000000;
 
 		pcie->peer_db_base[i]  = (char __iomem *)va + 0x20;
 		pcie->peer_db_off[i]   = 0;
-		pcie->peer_data_base[i] = (char __iomem *)va + 0x100000;
+		pcie->peer_data_base[i] = (char __iomem *)va + 0x2000000;
 		pcie->peer_data_dma[i]  = (dma_addr_t)data_pa;
 
 		dev_info(dev, "peer[%d] window target=0x%llx phys=0x%llx va=%px\n",
