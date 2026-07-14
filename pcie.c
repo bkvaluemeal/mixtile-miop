@@ -879,6 +879,15 @@ static int miop_pcie_ep_probe(struct device *dev)
 		for (i = 0; i < MIOP_DMA_NUM_CH; i++)
 			v &= ~(1u << i);
 		writel(v, pcie->dbi_base + 0x380054);
+
+		/* Enable DMA engine (factory batch path line 990 / irq init line 1367). */
+		writel(1, pcie->dbi_base + 0x38000C);
+		/* Per-channel enable (factory irq init line 1438). */
+		writel(1, pcie->dbi_base + 0x38002C);
+		/* Arm both channels (factory batch path line 1044, arm value
+		 * computed as (1 << ch) * 0x10001 = 0x10001 << ch). */
+		for (i = 0; i < MIOP_DMA_NUM_CH; i++)
+			writel(0x10001 << i, pcie->dbi_base + 0x380058);
 	}
 
 	/* MIOP tag + ring flag written to DBI (pcie_asm.S:2702-2723). */
