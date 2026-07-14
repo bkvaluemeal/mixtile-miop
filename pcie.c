@@ -486,8 +486,13 @@ static int miop_pcie_link_train(struct miop_pcie *pcie)
  */
 static void rk35_dma_start_write(struct miop_pcie *pcie, u32 ch)
 {
-	u32 v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
+	u32 v;
 
+	/* Factory batch path line 1044: arm channel before doorbell */
+	writel(0x10001 << ch, pcie->dbi_base + 0x380058);
+	dmb(oshst);
+
+	v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
 	writel((v & ~7) | ch, pcie->dbi_base + 0x380010);
 }
 
@@ -928,10 +933,20 @@ static int miop_pcie_ep_probe(struct device *dev)
 			writel(0x10001 << i, pcie->dbi_base + 0x380058);
 
 		dev_info(pcie->dev,
-			 "DMA init: buf=%p dma=%pad ring_dma[0]=%llx dbi=0x%08x\n",
+			 "DMA init: buf=%p dma=%pad ring_dma[0]=%llx "
+			 "ctrl[0]=0x%02x ctrl[8]=0x%08x "
+			 "dbi=0x%08x ch_st=0x%08x "
+			 "0x21C=0x%08x 0x200=0x%08x 0x0A8=0x%08x 0x0C4=0x%08x\n",
 			 pcie->dma_buf, &pcie->dma_dma,
 			 (u64)pcie->chan[0].ring_dma,
-			 readl(pcie->dbi_base + 0x38000C));
+			 *(u8 *)pcie->chan[0].ring,
+			 *(u32 *)((u8 *)pcie->chan[0].ring + 0xC00 + 8),
+			 readl(pcie->dbi_base + 0x38000C),
+			 readl(pcie->dbi_base + 0x38004C),
+			 readl(pcie->dbi_base + 0x38021C),
+			 readl(pcie->dbi_base + 0x380200),
+			 readl(pcie->dbi_base + 0x3800A8),
+			 readl(pcie->dbi_base + 0x3800C4));
 	}
 
 	/* Request the EP IRQ — rk35_ep_interrupt reaps DMA completions
