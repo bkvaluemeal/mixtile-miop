@@ -1072,6 +1072,10 @@ static int miop_pcie_ep_probe(struct device *dev)
 			 readl(pcie->dbi_base + 0x38004C),
 			 readl(pcie->dbi_base + 0x38004C),
 			 readl(pcie->apb_base + 0x10));
+
+		/* Clear self-test descriptor so net driver can use ring[0] */
+		d->status = 0;
+		wmb();
 	}
 
 	return 0;
