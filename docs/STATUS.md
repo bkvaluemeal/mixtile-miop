@@ -12,10 +12,34 @@ data-path logic is filled in incrementally afterward.
 | `miop-reg.ko`  | done         | n/a (registry only) | yes |
 | `miop-ep.ko`   | done         | resource_setup done; calls lower `probe()` | yes |
 | `miop-ep-net.ko` | done      | netdev alloc/register done; `on_peer_*`/`ndo_*` are stubs | yes (eth0, link down) |
-| `pcie-ep-rk35.ko` | done    | `probe()` is a stub returning 0 | yes (link down) |
+| `pcie-ep-rk35.ko` | done    | `probe()` wired: ctrl-config, bounded link-poll, set_bar, inbound ATU, peer-online trigger; MIOP exchange + outbound ATU still TODO | yes (loads; link trains? see below) |
 
-Current node2 boot state: our `ep` + `reg` + thin `net` + thin `pcie` →
-`eth0` DOWN, no `pci0`, no ping. Expected for thin-first.
+Current node2 boot state: our `ep` + `reg` + `net` + full `pcie` modules
+load and the EP probes cleanly (controller-config, set_bar, inbound ATU,
+IRQ wiring all transcribed and loading without oops). Link training now runs
+in a **continuous kthread** (`miop_link_worker`) — vendor-faithful: it polls
+`apb_base+0x300` (mask `0x3003f`, want `0x30011`) and also treats
+`dbi_base+0x100` low-16 == `0x15` as link-up, and on link-up drives the peer
+handshake. This does not block probe/boot and detects a link that comes up
+late (e.g. after the switch is reset).
+
+**Link does NOT train — environmental, not our code.** With our modules the
+EP sits in LTSSM Detect (`dbi_base+0x100 == 0x14820001`, `apb_base+0x300 ==
+0x0`); the controller's PCIe tree shows bus05 (node2's slot) EMPTY, i.e. the
+ASM2824 switch port to node2 is **disabled and not being re-enabled**. This
+was proven NOT to be our module: temporarily swapping in the **factory**
+modules (from node3) and rebooting node2 still leaves bus05 empty and the
+link in Detect. `nodectl poweroff/poweron`, a controller reboot (resets the
+switch), and a secondary-bus reset of port `0000:02:08.0` also fail to
+enable the port. The earlier "factory works / pci0 UP" result came from a
+specific full cluster power cycle that enabled node2's port; that enable
+condition is not currently reproducible via the software paths tried.
+
+**To test link training + the MIOP handshake, node2's switch port must be
+enabled** — most likely by a hard blade power-cycle (unplug/replug) or a
+full cluster power cycle that the controller's blade manager observes. Once
+the port enables, our kthread will detect link-up and run the (still-TODO)
+MIOP shared-header exchange + outbound ATU to the peer BAR target.
 
 ## Translated vs stubbed (per module)
 

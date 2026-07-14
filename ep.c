@@ -413,7 +413,7 @@ static int miop_ep_probe(struct platform_device *pdev)
 		goto err_phy_exit;
 
 	/* Finally, hand control to the lower-layer (RK35) EP driver. */
-	ret = pcie_drv->probe(dev);
+	ret = pcie_drv->init(dev);
 	if (ret)
 		goto err_phy_exit;
 

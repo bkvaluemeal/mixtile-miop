@@ -333,16 +333,13 @@ static int miop_pcie_map_inbound_atu(struct miop_pcie *pcie, u64 local)
 
 /*
  * miop_pcie_config_controller() - the controller/DLL configuration block
- * transcribed from pcie.S miop_pcie_ep_init (lines ~2527-2628). Pure mmio
+ * transcribed from pcie.S miop_pcie_ep_init (lines ~2527-2636). Pure mmio
  * pokes against pcie->dbi_base / pcie->apb_base; safe on our owned controller.
  *
- *  - APB glue: app base + 0x24 control bits.
- *  - DBI 0x380000 (RK APP) region: clear 0x54/0xa8.
- *  - DBI 0x710: link capability width (from num_lanes) + class/type bits.
- *  - DBI 0x80c: max link speed (from num_lanes).
- *  - DBI 0x8bc: EP/controller enable toggle.
- *  - DBI 0x4:  GEN/type register = 6.
- *  - DBI 0x0/0x2/0xc: Vendor/Device/Class of the EP function.
+ * Order matches factory: APB glue -> APP clears -> 0x710 lane cap -> 0x80c
+ * speed -> 0x4 type -> 0x8bc enable -> set_bar x4 -> Vendor/Device/Class ->
+ * 0x8bc disable -> inbound iATU.  IDs and BARs are programmed *after* the
+ * controller enable (0x8bc bit 0), not before.
  */
 static void miop_pcie_config_controller(struct miop_pcie *pcie,
 					struct miop_ep *ep)
@@ -371,39 +368,40 @@ static void miop_pcie_config_controller(struct miop_pcie *pcie,
 		if (lanes > 4)
 			cap = 0xf0000;
 		else
-			cap = 0x30000; /* lanes==3 et al: leave as x2 */
-		dev_info(pcie->dev, "unusual num_lanes=%u, using cap %#x\n",
-			 lanes, cap);
+			cap = 0x30000;
 		break;
 	}
 	writel((v & 0xffc0ffff) | cap, dbi + 0x710);
 
-	/* DBI 0x80c: max link speed from num_lanes. */
+	/* DBI 0x80c: max link speed + lane width (factory encoding). */
 	v = rk35_pcie_readl_dbi(dbi, 0x80c);
 	v &= 0xffffe0ff;
 	switch (lanes) {
-	case 1:  v |= 0x10000; break;
-	case 2:  v |= 0x20000; break;
-	case 4:  v |= 0x40000; break;
-	default: v |= 0x20000; break;
+	case 1:  v |= 0x200100; break;
+	case 2:  v |= 0x20200;  break;
+	case 4:  v |= 0x20400;  break;
+	default: v |= 0x20000;  break;
 	}
 	writel(v, dbi + 0x80c);
 
 	writel(6, dbi + 0x4);
 
-	/* EP function identity (type0 config header). */
-	writew(0x4586, dbi + 0x0);
-	writew(0xb6f2, dbi + 0x2);
-	writew(0x280,  dbi + 0xc);
-
-	/* Controller enable toggle (0x8bc = 1, then 0 after id writes). */
+	/* Controller enable (0x8bc |= 1) BEFORE programming config/IDs/BARs */
 	v = rk35_pcie_readl_dbi(dbi, 0x8bc);
 	writel(v | 0x1, dbi + 0x8bc);
-	/* set_bar x4 (EP BARs). */
+
+	/* set_bar x4 (EP BARs) — inside the enabled window, before IDs */
 	miop_pcie_ep_set_bar(pcie, 0, 0x2000000, 0xc);
 	miop_pcie_ep_set_bar(pcie, 2, 0, 0);
 	miop_pcie_ep_set_bar(pcie, 3, 0, 0);
 	miop_pcie_ep_set_bar(pcie, 4, 0x100000, 0xc);
+
+	/* EP function identity (type0 config header) — inside enabled window. */
+	writew(0x4586, dbi + 0x0);
+	writew(0xb6f2, dbi + 0x2);
+	writew(0x280,  dbi + 0xa);
+
+	/* Controller disable (0x8bc &= ~1). */
 	v = rk35_pcie_readl_dbi(dbi, 0x8bc);
 	writel(v & ~0x1, dbi + 0x8bc);
 
@@ -591,7 +589,7 @@ static int miop_pcie_ep_probe(struct device *dev)
 }
 
 static struct miop_pcie_ep_driver miop_pcie_driver = {
-	.probe = miop_pcie_ep_probe,
+	.init = miop_pcie_ep_probe,
 };
 
 /* ---- module init/exit: publish the driver struct ---------------- */
