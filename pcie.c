@@ -488,8 +488,6 @@ static void rk35_dma_start_write(struct miop_pcie *pcie, u32 ch)
 {
 	u32 v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
 
-	dev_info(pcie->dev, "DMA doorbell: read 0x%08x write ch=%u 0x%08x\n",
-		 v, ch, (v & ~7) | ch);
 	writel((v & ~7) | ch, pcie->dbi_base + 0x380010);
 }
 
@@ -886,30 +884,6 @@ static int miop_pcie_ep_probe(struct device *dev)
 		for (i = 0; i < MIOP_DMA_NUM_CH; i++)
 			v &= ~(1u << i);
 		writel(v, pcie->dbi_base + 0x380054);
-
-		/* Enable DMA engine (factory batch path line 990 / irq init line 1367). */
-		writel(1, pcie->dbi_base + 0x38000C);
-		/* Per-channel enable (factory irq init line 1438). */
-		writel(1, pcie->dbi_base + 0x38002C);
-		/* Descriptor config at ch0+0x100 offset (factory irq init line 1441). */
-		writel(0x40000308, pcie->dbi_base + 0x380300);
-		writel(0,          pcie->dbi_base + 0x380304);
-		/* Clear bit 0 of 0x3800A8 (factory irq init line 1451). */
-		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800A8);
-		writel(v & ~1u, pcie->dbi_base + 0x3800A8);
-		/* Set bit 16 of 0x3800C4 (factory irq init line 1461). */
-		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800C4);
-		writel(v | 0x10000, pcie->dbi_base + 0x3800C4);
-		/* Arm both channels (factory batch path line 1044, arm value
-		 * computed as (1 << ch) * 0x10001 = 0x10001 << ch). */
-		for (i = 0; i < MIOP_DMA_NUM_CH; i++)
-			writel(0x10001 << i, pcie->dbi_base + 0x380058);
-
-		dev_info(pcie->dev,
-			 "DMA init: buf=%p dma=%pad ring_dma[0]=%llx dbi=0x%08x\n",
-			 pcie->dma_buf, &pcie->dma_dma,
-			 (u64)pcie->chan[0].ring_dma,
-			 readl(pcie->dbi_base + 0x38000C));
 	}
 
 	/* MIOP tag + ring flag written to DBI (pcie_asm.S:2702-2723). */
@@ -928,6 +902,37 @@ static int miop_pcie_ep_probe(struct device *dev)
 
 	/* Bounded link-training poll. */
 	miop_pcie_link_train(pcie);
+
+	/* DMA engine init: must come after link training because the APB
+	 * glue writes (above) may reset the DMA sub-system. Factory does this
+	 * in the interrupt handler (triggered by RC doorbell after link-up). */
+	{
+		int i;
+		u32 v;
+
+		/* Enable DMA engine (factory batch path line 990 / irq init line 1367). */
+		writel(1, pcie->dbi_base + 0x38000C);
+		/* Per-channel enable (factory irq init line 1438). */
+		writel(1, pcie->dbi_base + 0x38002C);
+		/* Descriptor config at ch0+0x100 offset (factory irq init line 1441). */
+		writel(0x40000308, pcie->dbi_base + 0x380300);
+		writel(0,          pcie->dbi_base + 0x380304);
+		/* Clear bit 0 of 0x3800A8 (factory irq init line 1451). */
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800A8);
+		writel(v & ~1u, pcie->dbi_base + 0x3800A8);
+		/* Set bit 16 of 0x3800C4 (factory irq init line 1461). */
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x3800C4);
+		writel(v | 0x10000, pcie->dbi_base + 0x3800C4);
+		/* Arm both channels (factory batch path line 1044). */
+		for (i = 0; i < MIOP_DMA_NUM_CH; i++)
+			writel(0x10001 << i, pcie->dbi_base + 0x380058);
+
+		dev_info(pcie->dev,
+			 "DMA init: buf=%p dma=%pad ring_dma[0]=%llx dbi=0x%08x\n",
+			 pcie->dma_buf, &pcie->dma_dma,
+			 (u64)pcie->chan[0].ring_dma,
+			 readl(pcie->dbi_base + 0x38000C));
+	}
 
 	/* Request the EP IRQ — rk35_ep_interrupt reaps DMA completions
 	 * and handles doorbells from the RC. */
