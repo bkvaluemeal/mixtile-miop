@@ -17,6 +17,7 @@ struct miop_ep;
 struct miop_pcie;
 
 #define MIOP_DMA_RING_SIZE 128
+#define MIOP_DMA_RING_STRIDE (MIOP_DMA_RING_SIZE * sizeof(struct miop_dma_desc) + sizeof(struct miop_dma_desc))
 #define MIOP_DMA_NUM_CH 2
 
 struct miop_pcie_ep_driver {

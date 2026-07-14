@@ -577,6 +577,12 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 
 	chan->prod_idx = (idx + 1) & (MIOP_DMA_RING_SIZE - 1);
 
+	/* Write producer index to ring trailer (required by DMA engine) */
+	*(u32 *)((char *)chan->ring +
+		 MIOP_DMA_RING_SIZE * sizeof(struct miop_dma_desc) + 4) =
+		chan->prod_idx;
+	wmb();
+
 	spin_unlock_irqrestore(&chan->lock, flags);
 
 	dev_info(pcie->dev, "dma_submit ch=%u prod=%u len=%u dma=%llx desc[%u].status=%u\n",
@@ -827,12 +833,18 @@ static void miop_pcie_bar_check_work(struct work_struct *work)
 		 readl(pcie->dbi_base + 0x150),
 		 peer_low, peer_hi);
 
-	/* DMA self-test with the full factory sequence */
+	/* DMA self-test with the full factory batch-submit sequence */
 	{
 		struct miop_dma_desc *d = pcie->chan[0].ring;
-		u64 dest_addr = peer_addr > 0 ? peer_addr : 0x900030000ULL;
+		u64 dest_addr;
 		u32 r;
 		int tries = 0;
+
+		/* Only use peer_addr if it looks valid (< 64-bit PCIe space) */
+		if (peer_addr > 0x100000000ULL && peer_addr < 0x10000000000ULL)
+			dest_addr = peer_addr;
+		else
+			dest_addr = 0x900030000ULL;
 
 		dev_info(dev, "DMA self-test: dest=0x%llx ring_dma=0x%llx\n",
 			 dest_addr, (u64)pcie->chan[0].ring_dma);
@@ -846,9 +858,14 @@ static void miop_pcie_bar_check_work(struct work_struct *work)
 		d->status = 1;
 		wmb();
 
+		/* Write producer index (=1) to ring trailer */
+		*(u32 *)((char *)d +
+			 MIOP_DMA_RING_SIZE * sizeof(struct miop_dma_desc)
+			 + 4) = 1;
+		wmb();
+
 		/* Full factory batch-submit sequence */
 		writel(1, pcie->dbi_base + 0x38000C);          /* engine trip */
-
 		writel(0x40000308, pcie->dbi_base + 0x380200); /* ch0 write ctrl */
 		writel(0,          pcie->dbi_base + 0x380204); /* ch0 write status */
 		writel(0x40000308, pcie->dbi_base + 0x380300); /* ch0 read ctrl */
@@ -862,7 +879,6 @@ static void miop_pcie_bar_check_work(struct work_struct *work)
 		       pcie->dbi_base + 0x38031C);
 		writel((u32)(pcie->chan[0].ring_dma >> 32),
 		       pcie->dbi_base + 0x380320);
-		writel(1, pcie->dbi_base + 0x38002C);          /* engine GO */
 		dmb(oshst);
 
 		r = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
@@ -877,13 +893,19 @@ static void miop_pcie_bar_check_work(struct work_struct *work)
 		dmb(oshst);
 
 		r = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
-		writel(0, pcie->dbi_base + 0x380010);   /* doorbell ch0, raw write */
+		writel((r & ~7) | 0, pcie->dbi_base + 0x380010);
 		dmb(oshst);
 
 		r = readl(pcie->dbi_base + 0x38000C);
-		dev_info(dev, "DMA self-test: after doorbell 0x38000C=0x%08x "
-			 "0x380010=0x%08x\n", r,
-			 readl(pcie->dbi_base + 0x380010));
+		{
+			u32 *trailer_prod = (u32 *)((char *)d +
+				MIOP_DMA_RING_SIZE *
+				sizeof(struct miop_dma_desc) + 4);
+			dev_info(dev, "DMA self-test: after doorbell 0x38000C=0x%08x "
+				 "0x380010=0x%08x trailer_prod=%u\n", r,
+				 readl(pcie->dbi_base + 0x380010),
+				 *trailer_prod);
+		}
 
 		while (tries < 10000 && (d->status & 1)) {
 			udelay(100);
@@ -968,25 +990,32 @@ static int miop_pcie_ep_probe(struct device *dev)
 		wmb();
 	}
 
-	/* Initialize DMA rings (in our 4 MiB coherent buffer).
+	/* Initialize DMA rings with trailer (in our 4 MiB coherent buffer).
 	 * Per the factory, each ring has 128 × 24-byte descriptors followed
 	 * by a 24-byte control trailer at offset 0xC00.  The trailer contains
-	 * a magic byte at +0 and the ring's own bus address at +8 (used by
-	 * the hardware to locate the ring when the doorbell is rung). */
+	 * a magic byte at +0, the producer index at +4, and the ring's own
+	 * bus address at +8 (used by the hardware to locate the ring when
+	 * the doorbell is rung). */
 	{
 		int i;
 
 		for (i = 0; i < MIOP_DMA_NUM_CH; i++) {
 			struct miop_pcie_channel *ch = &pcie->chan[i];
-			size_t ring_sz = MIOP_DMA_RING_SIZE *
-					 sizeof(struct miop_dma_desc);
 
-			ch->ring = (struct miop_dma_desc *)((char *)dma_buf +
-							    0x100000 + i * ring_sz);
-			ch->ring_dma = dma_dma + 0x100000 + i * ring_sz;
+			ch->ring = (struct miop_dma_desc *)
+				((char *)dma_buf + 0x100000 +
+				 i * MIOP_DMA_RING_STRIDE);
+			ch->ring_dma = dma_dma + 0x100000 +
+				i * MIOP_DMA_RING_STRIDE;
 			ch->prod_idx = 0;
 			ch->cons_idx = 0;
 			spin_lock_init(&ch->lock);
+
+			/* Write ring bus address into trailer at +8 */
+			*(u64 *)((char *)ch->ring +
+				 MIOP_DMA_RING_SIZE *
+				 sizeof(struct miop_dma_desc) + 8) =
+				ch->ring_dma;
 		}
 	}
 
