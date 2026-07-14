@@ -1019,75 +1019,70 @@ static int miop_pcie_ep_probe(struct device *dev)
 		 ep->n_free, ep->n_win, pcie->serial,
 		 pcie->link_up ? "up" : "down");
 
-	/* DMA self-test: write a minimal descriptor and doorbell */
+	/* DMA self-test: minimal direct-mode write to verify engine works */
 	{
-		struct miop_dma_desc *d = pcie->chan[0].ring;
-		u32 v, r;
-		int tries = 0;
+		int tries;
+		u32 doorbell_sta, doorbell_db;
 
-		/* Set up outbound ATU for the DMA buffer so the write engine
-		 * can translate local → PCIe bus address.  Map 1 MiB at
-		 * dma_dma (0x0e000000) to a PCIe address in the peer BAR
-		 * window (0x06000000).  This is a minimal mapping; the real
-		 * net driver uses a different staging region. */
-		rk35_pcie_readl_dbi(pcie->dbi_base, 0x300000 + 0x00C);
-		writel(0x0e000000, pcie->dbi_base + 0x380000 + 0x100);
-		dmb(oshst);
-
-		memset(d, 0, sizeof(*d));
-		d->len = 8;
-		d->addr_low = (u32)pcie->dma_dma;
-		d->addr_high = 0;
-		/* Destination address (bytes 16-23) — factory passes peer BAR
-		 * address here; use a non-zero value so the DMA write engine
-		 * doesn't stall writing to bus address 0. */
-		*(u32 *)((char *)d + 16) = 0x06000000;
-		*(u32 *)((char *)d + 20) = 0;
-		wmb();
-		d->status = 1;
-		wmb();
-
-		/* Verify register access works */
-		r = readl(pcie->dbi_base + 0x380000);
-		dev_info(dev, "DMA test: 0x380000=0x%08x\n", r);
-		r = readl(pcie->dbi_base + 0x38000C);
-		dev_info(dev, "DMA test: before 0x38000C=0x%08x\n", r);
+		dev_info(dev, "DMA self-test BEGIN (%d channels)\n", pcie->num_chan);
 
 		writel(1, pcie->dbi_base + 0x38000C);
-		r = readl(pcie->dbi_base + 0x38000C);
-		dev_info(dev, "DMA test: after  0x38000C=0x%08x\n", r);
-
-		writel(0x40000308, pcie->dbi_base + 0x380200);
 		dmb(oshst);
+		dev_info(dev, "DMA: 0x38000C=0x%08x (1=enabled)\n",
+			 readl(pcie->dbi_base + 0x38000C));
 
+		/* Direct mode: bits [1:0]=10, and bits [3:2] must select write
+		 * engine for ch0.  Clear any pending first. */
 		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
-		writel(v & ~1u, pcie->dbi_base + 0x380054);
-		dmb(oshst);
-		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380090);
-		writel(v | 0x10000, pcie->dbi_base + 0x380090);
-		dmb(oshst);
-		writel(0x10001, pcie->dbi_base + 0x380058);
+		writel(v & ~3u, pcie->dbi_base + 0x380054);
 		dmb(oshst);
 
-		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
-		dev_info(dev, "DMA test: pre-doorbell 0x380010=0x%08x 0x38000C=0x%08x\n",
-			 v, readl(pcie->dbi_base + 0x38000C));
-		writel((v & ~7) | 0, pcie->dbi_base + 0x380010);
-		r = readl(pcie->dbi_base + 0x380010);
-		r = readl(pcie->dbi_base + 0x38000C);
-		dev_info(dev, "DMA test: post-doorbell 0x380010=0x%08x 0x38000C=0x%08x\n",
-			 readl(pcie->dbi_base + 0x380010), r);
+		/* Program ch0 doorbell config for direct mode */
+		writel(0x40000302, pcie->dbi_base + 0x380200);
+		dmb(oshst);
+		writel(0, pcie->dbi_base + 0x380204);
+		dmb(oshst);
+		dev_info(dev, "DMA: 0x380200=0x%08x (direct mode)\n",
+			 readl(pcie->dbi_base + 0x380200));
 
-		while (tries < 1000 && (d->status & 1)) {
+		/* Source address (local DDR, must be valid) */
+		writel((u32)pcie->dma_dma, pcie->dbi_base + 0x38020C);
+		dmb(oshst);
+		/* Destination address (PCIe bus address — 0 is valid for the
+		 * RC's memory window, or will get a master abort) */
+		writel(0, pcie->dbi_base + 0x380210);
+		dmb(oshst);
+		/* Transfer size */
+		writel(8, pcie->dbi_base + 0x380214);
+		dmb(oshst);
+
+		dev_info(dev, "DMA: src=0x%08x dst=0x%08x len=8\n",
+			 readl(pcie->dbi_base + 0x38020C),
+			 readl(pcie->dbi_base + 0x380210));
+
+		/* Doorbell — write ch number into low bits per factory */
+		doorbell_sta = readl(pcie->dbi_base + 0x380010);
+		doorbell_db = (doorbell_sta & ~7) | 0;
+		wmb();
+		writel(doorbell_db, pcie->dbi_base + 0x380010);
+		dmb(oshst);
+		dev_info(dev, "DMA: doorbell (0x380010) written 0x%08x\n",
+			 doorbell_db);
+
+		/* Poll for completion (either status or timeout) */
+		tries = 0;
+		while (tries < 1000) {
 			udelay(100);
+			v = readl(pcie->dbi_base + 0x38004C);
+			if ((v & 2) == 0)  /* bit 1 = active, 0 = idle */
+				break;
 			tries++;
 		}
-		dev_info(dev, "DMA self-test: status=%u after %dms "
-			 "0x38000C=0x%08x 0x38004C=0x%08x "
-			 "apb[0x10]=0x%08x\n",
-			 d->status, tries * 100 / 1000,
-			 readl(pcie->dbi_base + 0x38004C),
-			 readl(pcie->dbi_base + 0x38004C),
+		dev_info(dev, "DMA: done tries=%d 0x38004C=0x%08x "
+			 "0x38000C=0x%08x 0x380054=0x%08x apb[0x10]=0x%08x\n",
+			 tries, readl(pcie->dbi_base + 0x38004C),
+			 readl(pcie->dbi_base + 0x38000C),
+			 rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054),
 			 readl(pcie->apb_base + 0x10));
 	}
 
