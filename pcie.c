@@ -1038,6 +1038,11 @@ static int miop_pcie_ep_probe(struct device *dev)
 		d->len = 8;
 		d->addr_low = (u32)pcie->dma_dma;
 		d->addr_high = 0;
+		/* Destination address (bytes 16-23) — factory passes peer BAR
+		 * address here; use a non-zero value so the DMA write engine
+		 * doesn't stall writing to bus address 0. */
+		*(u32 *)((char *)d + 16) = 0x06000000;
+		*(u32 *)((char *)d + 20) = 0;
 		wmb();
 		d->status = 1;
 		wmb();
