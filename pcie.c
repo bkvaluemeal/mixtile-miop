@@ -260,6 +260,38 @@ enabled:
 EXPORT_SYMBOL(miop_ep_map_outbound_atu);
 
 /*
+ * miop_map_peer_bar() - map one per-peer outbound iATU window (local mirror of
+ * the factory's miop_rk35_map_peer_bar).  Programs an outbound window that
+ * translates a CPU write at `target` onto the fabric at `target` (identity
+ * map, matching the factory), then ioremaps `target` so callers can write the
+ * doorbell/data into it.  Returns the ioremap VA; *out_phys gets `target`.
+ */
+void *miop_map_peer_bar(struct miop_pcie *pcie, u64 target, u32 size, u64 *out_phys)
+{
+	void __iomem *va;
+
+	if (!pcie || !size)
+		return NULL;
+
+	if (miop_ep_map_outbound_atu(pcie, (u32)(target & 0xffffffff), size, 0)) {
+		dev_warn(pcie->dev, "map_peer_bar: ATU failed target=0x%llx\n",
+			 (unsigned long long)target);
+		return NULL;
+	}
+
+	va = ioremap(target, size);
+	if (IS_ERR_OR_NULL(va)) {
+		miop_ep_unmap_outbound_atu(pcie, target);
+		return NULL;
+	}
+
+	if (out_phys)
+		*out_phys = target;
+	return va;
+}
+EXPORT_SYMBOL(miop_map_peer_bar);
+
+/*
  * miop_pcie_ep_set_bar() - program one EP BAR. Transcribed from pcie.S
  * rk35_pcie_ep_set_bar.isra.0. The original ran on the vendor's struct
  * rockchip_pcie (dbi_base @0, apb_base @8); we drive our raw mmio directly.
@@ -1282,22 +1314,20 @@ static int miop_pcie_ep_probe(struct device *dev)
 	 * 0x903000000.  So node3 writing to node1 uses 0x903000000 and doorbell
 	 * 0x9000c0000. */
 	/* Per-peer window: ONE outbound iATU window per peer index (0..3),
-	 * exactly as the factory's miop_rk35_map_peer_bar expects (it keys the
-	 * mapping on peer[i].bar_base, so a second call for the same index is
-	 * rejected).  The factory reserves these windows for this EP, so calling
-	 * map_peer_bar(i) returns the canonical window already set up at probe:
-	 * the peer's listening address on the fabric.  We derive both the RX
-	 * doorbell (peer_db_base) and the TX data window (peer_data_base) from
-	 * that single window. */
+	 * mirroring the factory's miop_rk35_map_peer_bar.  The factory maps the
+	 * peer's listening region at target 0x90000000 + (peer<<25); we do the
+	 * same (outbound iATU identity-map + ioremap) so a write into the window
+	 * crosses the fabric to the peer's RX region.  Derive the RX doorbell
+	 * (+0x20, from miop_raise_peer_irq) and TX data (+0x100000) from it. */
 	dev_info(dev, "PEERMAP n_free=%lu n_win=%lu\n", ep->n_free, ep->n_win);
 
 	for (i = 0; i < 4; i++) {
 		u64 out_phys = 0;
 		void *va;
 		u64 db_pa, data_pa;
+		u64 target = 0x90000000ULL + ((u64)i << 25);
 
-		va = miop_rk35_map_peer_bar((struct device *)pcie, i, 0,
-					    0x1000000, &out_phys);
+		va = miop_map_peer_bar(pcie, target, 0x1000000, &out_phys);
 		if (!va) {
 			dev_warn(dev, "map_peer_bar peer=%d failed\n", i);
 			pcie->peer_db_base[i] = NULL;
@@ -1305,9 +1335,6 @@ static int miop_pcie_ep_probe(struct device *dev)
 			pcie->peer_data_dma[i] = 0;
 			continue;
 		}
-		/* The factory's peer window is the peer's listening region; the
-		 * RX doorbell register sits at offset 0x20 within it (from
-		 * miop_raise_peer_irq in pcie.S) and packet data at +0x100000. */
 		db_pa   = out_phys + 0x20;
 		data_pa = out_phys + 0x100000;
 
@@ -1316,8 +1343,9 @@ static int miop_pcie_ep_probe(struct device *dev)
 		pcie->peer_data_base[i] = (char __iomem *)va + 0x100000;
 		pcie->peer_data_dma[i]  = (dma_addr_t)data_pa;
 
-		dev_info(dev, "peer[%d] window phys=0x%llx va=%px (db+0x20, data+0x100000)\n",
-			 i, (unsigned long long)out_phys, va);
+		dev_info(dev, "peer[%d] window target=0x%llx phys=0x%llx va=%px\n",
+			 i, (unsigned long long)target,
+			 (unsigned long long)out_phys, va);
 	}
 
 	/* Request EP IRQ BEFORE the second APB write + link training poll,
@@ -1445,7 +1473,7 @@ static struct miop_pcie_ep_driver miop_pcie_driver = {
 	.raise_peer_irq      = miop_raise_peer_irq,
 	.dma_list_is_full    = miop_dma_list_is_full,
 	.dma_list_commit_pending = miop_dma_list_commit_pending,
-	.map_peer_bar        = miop_rk35_map_peer_bar, /* factory export */
+	.map_peer_bar        = NULL,	/* probe maps peer windows directly */
 	.unmap_peer_bar      = miop_rk35_unmap_peer_bar,
 	.map_rc_staging      = miop_rk35_map_rc_staging,
 	.unmap_rc_staging    = miop_rk35_unmap_rc_staging,
