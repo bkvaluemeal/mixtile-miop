@@ -1336,7 +1336,7 @@ static int miop_pcie_ep_probe(struct device *dev)
 		 * (= 0x90000000 + 2<<24 + 1<<20), i.e. the SENDER's id is in the
 		 * +20 byte.  So node3(src=3) -> node1 = 0x901000000,
 		 * node3 -> node2 = 0x902000000. */
-		u64 target = 0x90000000ULL + ((u64)i << 24) + (3ULL << 20);
+		u64 target = 0x900000000ULL + ((u64)i << 24) + (3ULL << 20);
 
 		va = miop_map_peer_bar(pcie, target, 0x3000000, &out_phys);
 		if (!va) {
