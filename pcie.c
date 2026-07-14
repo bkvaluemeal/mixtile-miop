@@ -1336,27 +1336,30 @@ static int miop_pcie_ep_probe(struct device *dev)
 		 * (= 0x90000000 + 2<<24 + 1<<20), i.e. the SENDER's id is in the
 		 * +20 byte.  So node3(src=3) -> node1 = 0x901000000,
 		 * node3 -> node2 = 0x902000000. */
-		u64 target = 0x900000000ULL + ((u64)i << 24) + (3ULL << 20);
+		u64 data_target = 0x900000000ULL + ((u64)i << 24) + (3ULL << 20);
+		/* RX doorbell register window: 0x90000000 + peer<<24 + 0x100000
+		 * (node1's doorbell is 0x900080000, node2's 0x9000c0000). */
+		u64 db_target = 0x90000000ULL + ((u64)i << 24) + 0x100000ULL;
+		void *va;
 
-		va = miop_map_peer_bar(pcie, target, 0x3000000, &out_phys);
+		va = miop_map_peer_bar(pcie, data_target, 0x3000000, &out_phys);
 		if (!va) {
-			dev_warn(dev, "map_peer_bar peer=%d failed\n", i);
-			pcie->peer_db_base[i] = NULL;
+			dev_warn(dev, "map_peer_bar peer=%d data failed\n", i);
 			pcie->peer_data_base[i] = NULL;
 			pcie->peer_data_dma[i] = 0;
-			continue;
+		} else {
+			pcie->peer_data_base[i] = (char __iomem *)va + 0x2000000;
+			pcie->peer_data_dma[i]  = (dma_addr_t)(out_phys + 0x2000000);
 		}
-		db_pa   = out_phys + 0x20;
-		data_pa = out_phys + 0x2000000;
 
-		pcie->peer_db_base[i]  = (char __iomem *)va + 0x20;
-		pcie->peer_db_off[i]   = 0;
-		pcie->peer_data_base[i] = (char __iomem *)va + 0x2000000;
-		pcie->peer_data_dma[i]  = (dma_addr_t)data_pa;
+		/* Separate window for the RX doorbell register. */
+		pcie->peer_db_base[i] = miop_map_peer_bar(pcie, db_target,
+							  0x1000, &out_phys);
+		pcie->peer_db_off[i]  = 0;
 
-		dev_info(dev, "peer[%d] window target=0x%llx phys=0x%llx va=%px\n",
-			 i, (unsigned long long)target,
-			 (unsigned long long)out_phys, va);
+		dev_info(dev, "peer[%d] data=0x%llx db=0x%llx\n", i,
+			 (unsigned long long)data_target,
+			 (unsigned long long)db_target);
 	}
 
 	/* Request EP IRQ BEFORE the second APB write + link training poll,
