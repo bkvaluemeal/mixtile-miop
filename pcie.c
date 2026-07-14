@@ -1296,7 +1296,8 @@ static int miop_pcie_ep_probe(struct device *dev)
 		void *va;
 		u64 db_pa, data_pa;
 
-		va = miop_rk35_map_peer_bar(pcie, i, 0, 0x1000000, &out_phys);
+		va = miop_rk35_map_peer_bar((struct device *)pcie, i, 0,
+					    0x1000000, &out_phys);
 		if (!va) {
 			dev_warn(dev, "map_peer_bar peer=%d failed\n", i);
 			pcie->peer_db_base[i] = NULL;
