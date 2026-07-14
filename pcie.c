@@ -345,13 +345,15 @@ static void miop_pcie_config_controller(struct miop_pcie *pcie,
 					struct miop_ep *ep)
 {
 	void __iomem *dbi = pcie->dbi_base;
-	void __iomem *apb = pcie->apb_base;
+	void __iomem *dbi2 = pcie->dbi_base2;
 	u32 lanes = ep->hw.num_lanes ? ep->hw.num_lanes : 4;
 	u32 v, cap;
 
-	/* APB glue. */
-	writel(0x8000800, apb);
-	writel(0x80000000, apb + 0x24);
+	/* APB glue — factory writes these to dbi_base2 (pcie_priv+16), NOT apb.
+	 * Factory struct: +16=dbi_base2, +24=apb_base. Our struct has them
+	 * swapped, so target dbi_base2 explicitly. */
+	writel(0x8000800, dbi2);
+	writel(0x80000000, dbi2 + 0x24);
 
 	/* RK APP region (DBI + 0x380000): clear two control registers. */
 	writel(0, dbi + 0x380000 + 0x54);
