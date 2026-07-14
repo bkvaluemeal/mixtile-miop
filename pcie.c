@@ -581,8 +581,8 @@ static int miop_dma_try_reap(struct miop_pcie *pcie, u32 ch)
 		spin_unlock_irqrestore(&chan->lock, flags);
 
 		if (save_cb) {
-			dma_unmap_page_attrs(pcie->dev, save_dma, save_len,
-					     DMA_TO_DEVICE, 0);
+			dma_unmap_single(pcie->dev, save_dma, save_len,
+					 DMA_TO_DEVICE);
 			save_cb(save_cookie, save_status);
 		}
 		done++;
