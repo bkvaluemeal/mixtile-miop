@@ -950,46 +950,9 @@ static void miop_elbi_disable_irq(struct miop_pcie *pcie, u32 irq_idx)
 	writel(val, reg);
 }
 
-static void *miop_rk35_map_peer_bar(struct device *dev, u32 peer,
-				    u64 phys, u32 size, u64 *out_phys)
-{
-	struct miop_ep *ep = *(struct miop_ep **)((char *)dev + 0x78);
-	struct miop_pcie *pcie = ep->pcie_priv;
-	void __iomem *va;
-
-	dev_info(dev, "map_peer_bar peer=%u phys=0x%llx size=0x%x\n",
-		 peer, (unsigned long long)phys, size);
-
-	if (peer >= 4 || !phys)
-		return NULL;
-
-	/* Mirror the factory: program an outbound iATU window that translates a
-	 * local CPU write at `phys` onto the fabric at `phys` (identity map, as
-	 * the factory passes phys as the ATU target), then ioremap the same
-	 * address so raise_peer_irq's doorbell write crosses the fabric. */
-	if (miop_ep_map_outbound_atu(pcie, (u32)(phys & 0xffffffff),
-				     size ? size : 0x1000000, 0)) {
-		dev_warn(dev, "map_peer_bar: outbound ATU failed peer=%u\n", peer);
-		return NULL;
-	}
-
-	/* Map the peer's EP DBI/ELBI window so raise_peer_irq can write the
-	 * doorbell into it (transcribed from pcie_asm.S map_peer_bar /
-	 * miop_raise_peer_irq).  The net driver passes the peer's doorbell
-	 * window physical base; we ioremap it and remember it per-peer. */
-	va = ioremap(phys, size ? size : 0x1000000);
-	if (IS_ERR_OR_NULL(va))
-		return NULL;
-
-	dev_info(dev, "map_peer_bar GOT CALLED peer=%u phys=0x%llx size=0x%x va=%px\n",
-		 peer, (unsigned long long)phys, size, va);
-
-	pcie->peer_db_base[peer] = va;
-	pcie->peer_db_off[peer] = 0;
-	if (out_phys)
-		*out_phys = phys;
-	return va;
-}
+/* miop_rk35_map_peer_bar() is provided by the factory pcie-ep-rk35.ko (see
+ * miop.h).  It allocates one outbound iATU window per peer index and returns
+ * the ioremap'd VA; *out_phys receives the window's fabric address. */
 
 static void miop_rk35_unmap_peer_bar(struct device *dev, u32 peer)
 {
@@ -1333,7 +1296,7 @@ static int miop_pcie_ep_probe(struct device *dev)
 		void *va;
 		u64 db_pa, data_pa;
 
-		va = miop_rk35_map_peer_bar(dev, i, 0, 0x1000000, &out_phys);
+		va = miop_rk35_map_peer_bar(pcie, i, 0, 0x1000000, &out_phys);
 		if (!va) {
 			dev_warn(dev, "map_peer_bar peer=%d failed\n", i);
 			pcie->peer_db_base[i] = NULL;
@@ -1481,7 +1444,7 @@ static struct miop_pcie_ep_driver miop_pcie_driver = {
 	.raise_peer_irq      = miop_raise_peer_irq,
 	.dma_list_is_full    = miop_dma_list_is_full,
 	.dma_list_commit_pending = miop_dma_list_commit_pending,
-	.map_peer_bar        = miop_rk35_map_peer_bar,
+	.map_peer_bar        = miop_rk35_map_peer_bar, /* factory export */
 	.unmap_peer_bar      = miop_rk35_unmap_peer_bar,
 	.map_rc_staging      = miop_rk35_map_rc_staging,
 	.unmap_rc_staging    = miop_rk35_unmap_rc_staging,

@@ -167,5 +167,10 @@ void miop_free_dma_skb_head(struct device *dev, struct sk_buff *skb, size_t size
 int miop_pcie_ep_resource_setup(struct platform_device *pdev, struct miop_ep_hw *hw);
 int miop_pcie_rx_region_alloc(struct device *dev, struct miop_ep_hw *hw, unsigned int idx);
 void miop_pcie_rx_region_free(struct device *dev, struct miop_ep_hw *hw, unsigned int idx);
+/* Factory-exported (pcie-ep-rk35.ko): maps one per-peer outbound iATU window.
+ * First argument is struct miop_pcie *; phys=0 lets it pick the canonical
+ * per-peer window (0x90000000 + peer<<25). Returns ioremap'd VA, *out_phys
+ * gets the window's fabric address. */
+void *miop_rk35_map_peer_bar(void *pcie, u32 peer, u64 phys, u32 size, u64 *out_phys);
 
 #endif /* MIOP_H */
