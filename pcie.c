@@ -1058,10 +1058,13 @@ static int miop_pcie_ep_probe(struct device *dev)
 		dmb(oshst);
 
 		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
-		dev_info(dev, "DMA test: pre-doorbell 0x380010=0x%08x\n", v);
+		dev_info(dev, "DMA test: pre-doorbell 0x380010=0x%08x 0x38000C=0x%08x\n",
+			 v, readl(pcie->dbi_base + 0x38000C));
 		writel((v & ~7) | 0, pcie->dbi_base + 0x380010);
 		r = readl(pcie->dbi_base + 0x380010);
-		dev_info(dev, "DMA test: post-doorbell 0x380010=0x%08x\n", r);
+		r = readl(pcie->dbi_base + 0x38000C);
+		dev_info(dev, "DMA test: post-doorbell 0x380010=0x%08x 0x38000C=0x%08x\n",
+			 readl(pcie->dbi_base + 0x380010), r);
 
 		while (tries < 1000 && (d->status & 1)) {
 			udelay(100);
