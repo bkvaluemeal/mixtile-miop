@@ -1323,14 +1323,18 @@ static int miop_pcie_ep_probe(struct device *dev)
 
 	for (i = 0; i < 4; i++) {
 		u64 out_phys = 0;
+		/* peer 0 is this node's own region; only TX to peers 1..3. */
+		if (i == 0)
+			continue;
 		void *va;
 		u64 db_pa, data_pa;
-		/* Peer p listens for RX data at 0x90000000 + (p<<24) + (SRC<<20),
-		 * where SRC is THIS node's id (3).  Verified by the working 2-node
-		 * link: node1(src=1)->node2 uses 0x903000000, node2(src=2)->node1
-		 * uses 0x901000000.  So node3(src=3)->node1 = 0x903000000,
-		 * node3->node2 = 0x902000000. */
-		u64 target = 0x90000000ULL + ((u64)i << 24) + (3ULL << 20);
+		/* The factory's canonical per-peer region is 0x90000000 +
+		 * (peer<<25): peer1=0x92000000, peer2=0x94000000, peer3=0x96000000
+		 * (from miop_rk35_map_peer_bar, pcie_asm.S:1892).  A node listens
+		 * for RX at its own peer index's region; node3 TX to peer p writes
+		 * into peer p's region.  The source node id rides in the doorbell
+		 * value (miop_raise_peer_irq), not the address. */
+		u64 target = 0x90000000ULL + ((u64)i << 25);
 
 		va = miop_map_peer_bar(pcie, target, 0x3000000, &out_phys);
 		if (!va) {
