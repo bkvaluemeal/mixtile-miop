@@ -129,6 +129,7 @@ struct miop_pcie {
 	int link_up;
 	struct task_struct *link_task;
 	struct timer_list reap_timer;
+	struct delayed_work bar_check_work;
 	struct miop_pcie_channel chan[MIOP_DMA_NUM_CH];
 };
 
