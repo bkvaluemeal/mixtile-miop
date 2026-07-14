@@ -1296,26 +1296,26 @@ static int miop_pcie_ep_probe(struct device *dev)
 		miop_elbi_enable_irq(pcie, i);
 	}
 
-	/* Map each peer's RX doorbell window.  The peer EP doorbell target
-	 * (where we write to assert the peer's RX doorbell) follows the pattern
-	 * of node1's factory PEER_DESC/ELBI table: base 0x900020000, stride
-	 * 0x40000 per peer (per node1 factory log PEER_ELBI/PEER_DESC).  Writing
-	 * our vector there produces an inbound PCIe MemWr on the peer that
-	 * asserts its RX doorbell IRQ.  Our net driver does not call
-	 * map_peer_bar, so map these here. */
+	/* Map each peer's RX doorbell window via map_peer_bar (which programs
+	 * the outbound iATU so the doorbell write actually crosses the fabric).
+	 * The peer EP doorbell target (where we write to assert the peer's RX
+	 * doorbell) follows node1's factory PEER_DESC/ELBI table: base
+	 * 0x900020000, stride 0x40000 per peer. */
 	for (i = 0; i < 4; i++) {
 		u64 elbi_pa = 0x900020000ULL + (u64)i * 0x40000ULL;
+		u64 out_phys = 0;
+		void *va;
 
-		pcie->peer_db_base[i] = ioremap(elbi_pa, 0x1000);
-		if (IS_ERR_OR_NULL(pcie->peer_db_base[i])) {
-			dev_warn(dev, "ioremap peer%d doorbell 0x%llx failed\n",
+		va = miop_rk35_map_peer_bar(dev, i, elbi_pa, 0x1000, &out_phys);
+		if (!va) {
+			dev_warn(dev, "map_peer_bar peer%d doorbell 0x%llx failed\n",
 				 i, (unsigned long long)elbi_pa);
 			pcie->peer_db_base[i] = NULL;
 		} else {
+			pcie->peer_db_base[i] = va;
 			pcie->peer_db_off[i] = 0;
 			dev_info(dev, "mapped peer%d doorbell @0x%llx -> %px\n",
-				 i, (unsigned long long)elbi_pa,
-				 pcie->peer_db_base[i]);
+				 i, (unsigned long long)elbi_pa, va);
 		}
 	}
 
