@@ -1318,42 +1318,42 @@ static int miop_pcie_ep_probe(struct device *dev)
 	 * lands at 0x903000000, node2->node1 at 0x901000000, node3 receives at
 	 * 0x903000000.  So node3 writing to node1 uses 0x903000000 and doorbell
 	 * 0x9000c0000. */
+	/* Per-peer window: ONE outbound iATU window per peer index (0..3),
+	 * exactly as the factory's miop_rk35_map_peer_bar expects (it keys the
+	 * mapping on peer[i].bar_base, so a second call for the same index is
+	 * rejected).  The factory reserves these windows for this EP, so calling
+	 * map_peer_bar(i) returns the canonical window already set up at probe:
+	 * the peer's listening address on the fabric.  We derive both the RX
+	 * doorbell (peer_db_base) and the TX data window (peer_data_base) from
+	 * that single window. */
+	dev_info(dev, "PEERMAP n_free=%lu n_win=%lu\n", ep->n_free, ep->n_win);
+
 	for (i = 0; i < 4; i++) {
-		u64 win_base = 0x90000000ULL + ((u64)i << 24) + (3ULL << 20);
-		u64 data_pa = win_base + 0x100000ULL;
-		u64 db_pa   = win_base;
 		u64 out_phys = 0;
-		void *db_va, *data_va;
+		void *va;
+		u64 db_pa, data_pa;
 
-		/* RX doorbell window (raise_peer_irq target). */
-		db_va = miop_rk35_map_peer_bar(dev, i, db_pa, 0x1000, &out_phys);
-		if (!db_va) {
-			dev_warn(dev, "map_peer_bar node%d doorbell 0x%llx failed\n",
-				 i, (unsigned long long)db_pa);
+		va = miop_rk35_map_peer_bar(dev, i, 0, 0x1000000, &out_phys);
+		if (!va) {
+			dev_warn(dev, "map_peer_bar peer=%d failed\n", i);
 			pcie->peer_db_base[i] = NULL;
-		} else {
-			pcie->peer_db_base[i] = db_va;
-			pcie->peer_db_off[i] = 0;
-			dev_info(dev, "mapped node%d doorbell @0x%llx -> %px\n",
-				 i, (unsigned long long)db_pa, db_va);
-		}
-
-		/* TX data window: coherent bounce buffer mapped to the peer's
-		 * address space via the outbound iATU so the eDMA write lands in
-		 * the peer's RX ring. */
-		data_va = miop_rk35_map_peer_bar(dev, i, data_pa, 0x1000000,
-						  &out_phys);
-		if (!data_va) {
-			dev_warn(dev, "map_peer_bar node%d data 0x%llx failed\n",
-				 i, (unsigned long long)data_pa);
 			pcie->peer_data_base[i] = NULL;
 			pcie->peer_data_dma[i] = 0;
-		} else {
-			pcie->peer_data_base[i] = data_va;
-			pcie->peer_data_dma[i] = (dma_addr_t)data_pa;
-			dev_info(dev, "mapped node%d data @0x%llx -> %px\n",
-				 i, (unsigned long long)data_pa, data_va);
+			continue;
 		}
+		/* The factory's peer window is the peer's listening region; the
+		 * RX doorbell register sits at offset 0x20 within it (from
+		 * miop_raise_peer_irq in pcie.S) and packet data at +0x100000. */
+		db_pa   = out_phys + 0x20;
+		data_pa = out_phys + 0x100000;
+
+		pcie->peer_db_base[i]  = (char __iomem *)va + 0x20;
+		pcie->peer_db_off[i]   = 0;
+		pcie->peer_data_base[i] = (char __iomem *)va + 0x100000;
+		pcie->peer_data_dma[i]  = (dma_addr_t)data_pa;
+
+		dev_info(dev, "peer[%d] window phys=0x%llx va=%px (db+0x20, data+0x100000)\n",
+			 i, (unsigned long long)out_phys, va);
 	}
 
 	/* Request EP IRQ BEFORE the second APB write + link training poll,
