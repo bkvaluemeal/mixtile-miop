@@ -509,7 +509,7 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 	track = &chan->track[idx];
 
 	if (desc->status & 1) {
-		/* ring full — advance past already-submitted entries */
+		dev_err(pcie->dev, "dma_submit: ring[%u] full, advancing\n", idx);
 		idx = (idx + 1) & (MIOP_DMA_RING_SIZE - 1);
 		chan->prod_idx = idx;
 		desc = &chan->ring[idx];
@@ -536,6 +536,8 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 
 	spin_unlock_irqrestore(&chan->lock, flags);
 
+	dev_dbg(pcie->dev, "dma_submit ch=%u prod=%u len=%u dma=%llx\n",
+		ch, chan->prod_idx, len, data);
 	rk35_dma_start_write(pcie, ch);
 	return 0;
 }
@@ -627,10 +629,14 @@ static irqreturn_t rk35_ep_interrupt(int irq, void *dev_id)
 
 	apb_st = readl(pcie->apb_base + 0x10);
 
+	dev_dbg(pcie->dev, "IRQ apb_st=0x%08x\n", apb_st);
+
 	if (apb_st & (1u << 15)) {
-		/* doorbell from RC — read the doorbell value */
 		u32 db_val = rk35_pcie_readl_dbi(pcie->dbi_base, 0x200e00);
 		u32 peer = (db_val >> 8) & 0xff;
+
+		dev_dbg(pcie->dev, "IRQ doorbell db_val=0x%08x peer=%u\n",
+			db_val, peer);
 
 		ep = pcie->ep;
 		net = ep ? ep->net_drv : NULL;
@@ -790,7 +796,11 @@ static int miop_pcie_ep_probe(struct device *dev)
 		wmb();
 	}
 
-	/* Initialize DMA rings (in our 4 MiB coherent buffer). */
+	/* Initialize DMA rings (in our 4 MiB coherent buffer).
+	 * Per the factory, each ring has 128 × 24-byte descriptors followed
+	 * by a 24-byte control trailer at offset 0xC00.  The trailer contains
+	 * a magic byte at +0 and the ring's own bus address at +8 (used by
+	 * the hardware to locate the ring when the doorbell is rung). */
 	{
 		int i;
 
@@ -798,6 +808,8 @@ static int miop_pcie_ep_probe(struct device *dev)
 			struct miop_pcie_channel *ch = &pcie->chan[i];
 			size_t ring_sz = MIOP_DMA_RING_SIZE *
 					 sizeof(struct miop_dma_desc);
+			u8 *ctrl;
+			int j;
 
 			ch->ring = (struct miop_dma_desc *)((char *)dma_buf +
 							    0x100000 + i * ring_sz);
@@ -805,6 +817,15 @@ static int miop_pcie_ep_probe(struct device *dev)
 			ch->prod_idx = 0;
 			ch->cons_idx = 0;
 			spin_lock_init(&ch->lock);
+
+			/* Control trailer at ring + 0xC00 */
+			ctrl = (u8 *)ch->ring + ring_sz;
+			ctrl[0] = 0x05;
+			*(u32 *)(ctrl + 8) = (u32)ch->ring_dma;
+			*(u32 *)(ctrl + 12) = 0;
+			for (j = 1; j < 8; j++)
+				ctrl[j] = 0;
+			dmb(oshst);
 		}
 	}
 
