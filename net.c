@@ -122,8 +122,11 @@ static const struct net_device_ops miop_netdev_ops = {
 
 static int miop_on_peer_online(struct miop_ep *ep, int peer)
 {
-	netif_carrier_on(ep->hw.net_priv ?
-		*((struct net_device **)((char *)ep->hw.net_priv + 48)) : NULL);
+	struct miop_net_priv *priv =
+		(struct miop_net_priv *)ep->hw.net_priv;
+
+	if (priv && priv->netdev)
+		netif_carrier_on(priv->netdev);
 	return 0;
 }
 
@@ -134,13 +137,15 @@ static int miop_on_peer_offline(struct miop_ep *ep, int peer)
 
 static int miop_on_rx(struct miop_ep *ep, int peer, void *buf, int len)
 {
+	struct miop_net_priv *priv;
 	struct net_device *netdev;
 	struct sk_buff *skb;
 
 	if (!ep || !ep->hw.net_priv)
 		return 0;
 
-	netdev = *((struct net_device **)((char *)ep->hw.net_priv + 48));
+	priv = (struct miop_net_priv *)ep->hw.net_priv;
+	netdev = priv->netdev;
 	if (!netdev)
 		return 0;
 
@@ -234,13 +239,15 @@ EXPORT_SYMBOL(miop_ep_net_init);
 int miop_ep_net_deinit(struct device *dev)
 {
 	struct miop_ep *ep;
+	struct miop_net_priv *priv;
 	struct net_device *netdev;
 
 	ep = *(struct miop_ep **)((char *)dev + 0x78);
 	if (!ep || !ep->hw.net_priv)
 		return 0;
 
-	netdev = *((struct net_device **)((char *)ep->hw.net_priv + 48));
+	priv = (struct miop_net_priv *)ep->hw.net_priv;
+	netdev = priv->netdev;
 	if (netdev) {
 		unregister_netdev(netdev);
 		free_netdev(netdev);

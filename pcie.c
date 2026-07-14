@@ -563,6 +563,10 @@ static int miop_pcie_ep_probe(struct device *dev)
 	/* Controller / DLL configuration (DBI/APB pokes). */
 	miop_pcie_config_controller(pcie, ep);
 
+	/* MIOP tag + ring flag written to DBI (pcie_asm.S:2702-2723). */
+	writel(0x100000, pcie->dbi_base + 0x200e14);
+	writel(0x504f494d, pcie->dbi_base + 0x200e10);
+
 	/* Trigger link training: three writes to apb_base (pcie_asm.S:2742-2754). */
 	if (pcie->apb_base) {
 		writel(0x100010, pcie->apb_base + 0x180);
