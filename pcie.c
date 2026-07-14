@@ -360,9 +360,6 @@ static void miop_pcie_config_controller(struct miop_pcie *pcie,
 	 * The second write (after IRQ request) uses 0xf00000 / 0xc000c. */
 	writel(0x100010, apb + 0x180);
 	writel(0x8000800, apb);
-	writel(0x80000000, apb + 0x24);
-
-	writel(0x80000000, apb + 0x24);
 
 	/* RK APP region (DBI + 0x380000): clear two control registers. */
 	writel(0, dbi + 0x380000 + 0x54);
@@ -484,8 +481,27 @@ static void rk35_dma_start_write(struct miop_pcie *pcie, u32 ch)
 {
 	u32 v;
 
-	/* Factory batch path line 1044: arm channel before doorbell */
-	writel(0x10001 << ch, pcie->dbi_base + 0x380058);
+	/* Factory batch path lines 990-1044, in order:
+	 *   1. Re-enable DMA engine (0x38000C = 1)
+	 *   2. Clear doorbell pending bits for this channel (0x380054)
+	 *   3. Enable per-channel interrupt (0x380090)
+	 *   4. Arm channel (0x380058)
+	 *   5. Doorbell (0x380010)
+	 */
+	u32 ch_mask = 1u << ch;
+
+	writel(1, pcie->dbi_base + 0x38000C);
+	dmb(oshst);
+
+	v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
+	writel(v & ~ch_mask, pcie->dbi_base + 0x380054);
+	dmb(oshst);
+
+	v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380090);
+	writel(v | (ch_mask << 16), pcie->dbi_base + 0x380090);
+	dmb(oshst);
+
+	writel(ch_mask | (ch_mask << 16), pcie->dbi_base + 0x380058);
 	dmb(oshst);
 
 	v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
