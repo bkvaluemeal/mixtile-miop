@@ -663,7 +663,7 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 		return -ENODEV;
 	/* Free the skb once; it was copied into each peer window above and the
 	 * eDMA reads have completed (we polled per peer). */
-	dev_kfree_skb_any((struct sk_buff *)(unsigned long)cookie);
+	dev_kfree_skb((struct sk_buff *)(unsigned long)cookie);
 	return 0;
 }
 
@@ -1312,17 +1312,17 @@ static int miop_pcie_ep_probe(struct device *dev)
 	}
 
 	/* Per-peer TX data window + RX doorbell window, one per destination node.
-	 * The factory writes packet data into the peer's data window via an
-	 * outbound iATU (node N's data window 0x90000000 + N<<24 + 0x100000;
-	 * node1->node2 used 0x903000000, node2->node1 used 0x901000000).  The RX
-	 * doorbell window is at 0x90000000 + N<<24.  Index by DESTINATION NODE. */
+	 * The factory encodes the address as 0x90000000 + (DEST_NODE<<24) +
+	 * (SRC_PEER_IDX<<20) + offset, where SRC_PEER_IDX is THIS node's peer
+	 * slot in the peer's EP.  node1->node2 uses peer[1]=0x903000000,
+	 * node2->node1 uses peer[0]=0x901000000.  For node3 (SRC_PEER_IDX=2):
+	 * data to node1 = 0x901000000, doorbell to node1 = 0x900080000. */
 	for (i = 0; i < 4; i++) {
-		u64 win_base = 0x90000000ULL + ((u64)i << 24);
+		u64 win_base = 0x90000000ULL + ((u64)i << 24) + (2ULL << 20);
 		u64 data_pa = win_base + 0x100000ULL;
 		u64 db_pa   = win_base;
 		u64 out_phys = 0;
 		void *db_va, *data_va;
-		dma_addr_t data_dma;
 
 		/* RX doorbell window (raise_peer_irq target). */
 		db_va = miop_rk35_map_peer_bar(dev, i, db_pa, 0x1000, &out_phys);
@@ -1349,8 +1349,6 @@ static int miop_pcie_ep_probe(struct device *dev)
 			pcie->peer_data_dma[i] = 0;
 		} else {
 			pcie->peer_data_base[i] = data_va;
-			/* The eDMA destination is the peer's address (the iATU
-			 * target == the bus address we wrote). */
 			pcie->peer_data_dma[i] = (dma_addr_t)data_pa;
 			dev_info(dev, "mapped node%d data @0x%llx -> %px\n",
 				 i, (unsigned long long)data_pa, data_va);
