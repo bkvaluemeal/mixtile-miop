@@ -77,6 +77,15 @@ struct miop_ep_hw {
 	void *net_priv;
 };
 
+struct miop_pcie_channel {
+	struct miop_dma_desc *ring;              /* descriptor ring vaddr (in dma_buf) */
+	dma_addr_t ring_dma;                     /* dma address of ring */
+	u16 prod_idx;                            /* next slot to write */
+	u16 cons_idx;                            /* next slot to reap */
+	spinlock_t lock;                         /* per-channel lock */
+	struct miop_dma_track track[MIOP_DMA_RING_SIZE];
+};
+
 struct miop_pcie {
 	struct miop_ep *ep;
 	void __iomem *dbi_base;
@@ -95,6 +104,7 @@ struct miop_pcie {
 	u32 serial;
 	int link_up;
 	struct task_struct *link_task;
+	struct miop_pcie_channel chan[MIOP_DMA_NUM_CH];
 };
 
 struct miop_ep {

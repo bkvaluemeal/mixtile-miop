@@ -470,22 +470,248 @@ static int miop_pcie_link_train(struct miop_pcie *pcie)
 }
 
 /*
- * miop_ep_irq_stub() - minimal IRQ handler. The vendor's real handler
- * (rk35_ep_interrupt) reaps the DMA rings and drives the peer handshake; that
- * is wired in a later pass. Here we clear the APB status register
- * (apb+0x10, written back to clear) so a level-triggered line cannot storm,
- * and report handled.
+ * rk35_dma_start_write() — doorbell the hardware to process a channel's ring.
+ * Translated from pcie_asm.S line 741.
  */
-static irqreturn_t miop_ep_irq_stub(int irq, void *dev_id)
+static void rk35_dma_start_write(struct miop_pcie *pcie, u32 ch)
+{
+	u32 v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
+
+	writel((v & ~7) | ch, pcie->dbi_base + 0x380010);
+}
+
+/*
+ * miop_rk35_dma_submit() — submit one DMA descriptor.
+ * Translated from pcie_asm.S line 19.
+ *
+ * Writes the descriptor to ring[prod_idx], stores the completion tracking
+ * entry, advances the producer index, then doorbells the hardware.
+ */
+static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
+				u64 ext, u32 len, u64 cookie, void *cb)
+{
+	struct miop_ep *ep = *(struct miop_ep **)((char *)dev + 0x78);
+	struct miop_pcie *pcie = ep->pcie_priv;
+	struct miop_pcie_channel *chan;
+	struct miop_dma_desc *desc;
+	struct miop_dma_track *track;
+	unsigned long flags;
+	u16 idx;
+
+	if (ch >= MIOP_DMA_NUM_CH)
+		return -EINVAL;
+
+	chan = &pcie->chan[ch];
+	spin_lock_irqsave(&chan->lock, flags);
+
+	idx = chan->prod_idx;
+	desc = &chan->ring[idx];
+	track = &chan->track[idx];
+
+	if (desc->status & 1) {
+		/* ring full — advance past already-submitted entries */
+		idx = (idx + 1) & (MIOP_DMA_RING_SIZE - 1);
+		chan->prod_idx = idx;
+		desc = &chan->ring[idx];
+		track = &chan->track[idx];
+	}
+
+	desc->len       = len;
+	desc->addr_low  = (u32)data;
+	desc->addr_high = (u32)(data >> 32);
+	desc->meta_len  = (u16)ext;
+	desc->meta      = (u16)(ext >> 16);
+	desc->meta2     = (u32)(ext >> 32);
+
+	track->cookie = cookie;
+	track->cb     = cb;
+	track->dma    = (dma_addr_t)data;
+	track->len    = len;
+
+	wmb();
+	desc->status = 1;
+	wmb();
+
+	chan->prod_idx = (idx + 1) & (MIOP_DMA_RING_SIZE - 1);
+
+	spin_unlock_irqrestore(&chan->lock, flags);
+
+	rk35_dma_start_write(pcie, ch);
+	return 0;
+}
+
+/*
+ * miop_dma_try_reap() — walk the ring from cons_idx to prod_idx, reap
+ * completed descriptors and invoke their callbacks.
+ * Translated from pcie_asm.S line 500.
+ */
+static int miop_dma_try_reap(struct miop_pcie *pcie, u32 ch)
+{
+	struct miop_pcie_channel *chan = &pcie->chan[ch];
+	u16 done = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&chan->lock, flags);
+
+	while (chan->cons_idx != chan->prod_idx) {
+		u16 idx = chan->cons_idx;
+		struct miop_dma_desc *desc = &chan->ring[idx];
+		struct miop_dma_track *track = &chan->track[idx];
+		dma_addr_t save_dma;
+		u32 save_len;
+		u64 save_cookie;
+		void (*save_cb)(u64, u64);
+		u32 save_status;
+
+		if (desc->status & 1)
+			break;
+
+		save_dma    = track->dma;
+		save_len    = track->len;
+		save_cookie = track->cookie;
+		save_cb     = track->cb;
+		save_status = desc->status;
+
+		memset(desc, 0, sizeof(*desc));
+		memset(track, 0, sizeof(*track));
+		chan->cons_idx = (idx + 1) & (MIOP_DMA_RING_SIZE - 1);
+
+		spin_unlock_irqrestore(&chan->lock, flags);
+
+		if (save_cb) {
+			dma_unmap_page_attrs(pcie->dev, save_dma, save_len,
+					     DMA_TO_DEVICE, 0);
+			save_cb(save_cookie, save_status);
+		}
+		done++;
+
+		spin_lock_irqsave(&chan->lock, flags);
+	}
+
+	spin_unlock_irqrestore(&chan->lock, flags);
+	return done;
+}
+
+/*
+ * miop_raise_peer_irq() — notify the RC that new data is available in our
+ * descriptor ring. Writes a doorbell value to the RC-visible doorbell reg.
+ * Translated from pcie_asm.S line 782.
+ */
+static int miop_raise_peer_irq(struct device *dev, u32 peer_id, u32 vector)
+{
+	struct miop_ep *ep = *(struct miop_ep **)((char *)dev + 0x78);
+	struct miop_pcie *pcie = ep->pcie_priv;
+
+	if (!pcie->dbi_base)
+		return 0;
+
+	/* write vector to the doorbell register the RC monitors */
+	writel(vector, pcie->dbi_base + 0x200e00);
+	return 0;
+}
+
+/*
+ * rk35_ep_interrupt() — EP interrupt handler. Reads APB status, handles
+ * doorbells from the RC, and reaps completed DMA descriptors.
+ * Translated from pcie_asm.S line 1208.
+ */
+static irqreturn_t rk35_ep_interrupt(int irq, void *dev_id)
 {
 	struct miop_pcie *pcie = dev_id;
+	struct miop_ep *ep;
+	struct miop_ep_net_driver *net;
+	u32 apb_st;
 
-	if (pcie && pcie->apb_base) {
-		u32 st = readl(pcie->apb_base + 0x10);
+	if (!pcie || !pcie->apb_base)
+		return IRQ_NONE;
 
-		writel(st, pcie->apb_base + 0x10);
+	apb_st = readl(pcie->apb_base + 0x10);
+
+	if (apb_st & (1u << 15)) {
+		/* doorbell from RC — read the doorbell value */
+		u32 db_val = rk35_pcie_readl_dbi(pcie->dbi_base, 0x200e00);
+		u32 peer = (db_val >> 8) & 0xff;
+
+		ep = pcie->ep;
+		net = ep ? ep->net_drv : NULL;
+
+		if (net) {
+			if (db_val & 1)
+				net->on_peer_online(ep, peer);
+			if (db_val & 2)
+				net->on_rx(ep, peer, NULL, 0);
+			if (db_val & 4)
+				net->on_tx_ready(ep, peer);
+			if (db_val & 8)
+				net->on_peer_offline(ep, peer);
+		}
 	}
+
+	miop_dma_try_reap(pcie, 0);
+	miop_dma_try_reap(pcie, 1);
+
+	writel(apb_st, pcie->apb_base + 0x10);
 	return IRQ_HANDLED;
+}
+
+/* ---- DMA helpers wired to the driver struct ---- */
+
+static int miop_dma_list_is_full(struct device *dev, u32 channel)
+{
+	struct miop_ep *ep = *(struct miop_ep **)((char *)dev + 0x78);
+	struct miop_pcie *pcie = ep->pcie_priv;
+	struct miop_pcie_channel *chan;
+
+	if (channel >= MIOP_DMA_NUM_CH || !pcie)
+		return 1;
+
+	chan = &pcie->chan[channel];
+	return (chan->ring[chan->prod_idx].status & 1) ? 1 : 0;
+}
+
+static void miop_dma_list_commit_pending(struct device *dev)
+{
+	/* With single-descriptor submission we have no batch to commit.
+	 * rk35_dma_start_write was already called per submit.  The factory
+	 * batch path (pcie_asm.S:2019) walks a pending list and programs the
+	 * doorbell; for the non-batch path this is a no-op. */
+}
+
+static int miop_elbi_enable_irq(struct device *dev, u32 irq_idx)
+{
+	return 0;
+}
+
+static int miop_elbi_disable_irq(struct device *dev, u32 irq_idx)
+{
+	return 0;
+}
+
+static void *miop_rk35_map_peer_bar(struct device *dev, u32 peer,
+				    u64 phys, u32 size, u64 *out_phys)
+{
+	return NULL;
+}
+
+static void miop_rk35_unmap_peer_bar(struct device *dev, u32 peer)
+{
+}
+
+static void *miop_rk35_map_rc_staging(struct device *dev, u64 phys,
+				      u32 size, u32 dir)
+{
+	return NULL;
+}
+
+static void miop_rk35_unmap_rc_staging(struct device *dev, u32 dir)
+{
+}
+
+static int miop_rk35_dma_submit_batch(struct device *dev, u32 ch,
+				      void *batch, u32 count,
+				      u64 comp, void *cb)
+{
+	return -EINVAL;
 }
 
 /*
@@ -564,6 +790,24 @@ static int miop_pcie_ep_probe(struct device *dev)
 		wmb();
 	}
 
+	/* Initialize DMA rings (in our 4 MiB coherent buffer). */
+	{
+		int i;
+
+		for (i = 0; i < MIOP_DMA_NUM_CH; i++) {
+			struct miop_pcie_channel *ch = &pcie->chan[i];
+			size_t ring_sz = MIOP_DMA_RING_SIZE *
+					 sizeof(struct miop_dma_desc);
+
+			ch->ring = (struct miop_dma_desc *)((char *)dma_buf +
+							    0x100000 + i * ring_sz);
+			ch->ring_dma = dma_dma + 0x100000 + i * ring_sz;
+			ch->prod_idx = 0;
+			ch->cons_idx = 0;
+			spin_lock_init(&ch->lock);
+		}
+	}
+
 	/* Controller / DLL configuration (DBI/APB pokes). */
 	miop_pcie_config_controller(pcie, ep);
 
@@ -585,12 +829,12 @@ static int miop_pcie_ep_probe(struct device *dev)
 	/* Bounded link-training poll. */
 	miop_pcie_link_train(pcie);
 
-	/* Request the EP "sys" IRQ with a stub handler (clears status). The real
-	 * DMA-reap / peer-handshake handler is wired in a later pass. */
+	/* Request the EP IRQ — rk35_ep_interrupt reaps DMA completions
+	 * and handles doorbells from the RC. */
 	if (ep->hw.irq > 0) {
 		int ret = devm_request_threaded_irq(dev, ep->hw.irq,
-						     miop_ep_irq_stub,
-						     miop_ep_irq_stub,
+						     rk35_ep_interrupt,
+						     rk35_ep_interrupt,
 						     IRQF_SHARED,
 						     "miop_ep_irq", pcie);
 		if (ret)
@@ -608,7 +852,20 @@ static int miop_pcie_ep_probe(struct device *dev)
 }
 
 static struct miop_pcie_ep_driver miop_pcie_driver = {
-	.init = miop_pcie_ep_probe,
+	.init                = miop_pcie_ep_probe,
+	.deinit              = NULL,
+	.machine_id          = miop_ep_machine_id,
+	.elbi_enable_irq     = miop_elbi_enable_irq,
+	.elbi_disable_irq    = miop_elbi_disable_irq,
+	.raise_peer_irq      = miop_raise_peer_irq,
+	.dma_list_is_full    = miop_dma_list_is_full,
+	.dma_list_commit_pending = miop_dma_list_commit_pending,
+	.map_peer_bar        = miop_rk35_map_peer_bar,
+	.unmap_peer_bar      = miop_rk35_unmap_peer_bar,
+	.map_rc_staging      = miop_rk35_map_rc_staging,
+	.unmap_rc_staging    = miop_rk35_unmap_rc_staging,
+	.dma_submit          = miop_rk35_dma_submit,
+	.dma_submit_batch    = miop_rk35_dma_submit_batch,
 };
 
 /* ---- module init/exit: publish the driver struct ---------------- */
