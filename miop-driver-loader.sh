@@ -11,7 +11,8 @@ if [ -d /lib/miop ]; then
     insmod miop-reg.ko
     insmod pcie-ep-rk35.ko
     insmod miop-ep-net.ko
-    insmod miop-ep.ko
+    # Skip miop-ep.ko — factory EP driver conflicts with pcie-ep-rk35.ko
+    # insmod miop-ep.ko
     bind_miop_pcie_irq_to_cpu4
     popd >/dev/null
 fi

@@ -1012,12 +1012,21 @@ static int miop_pcie_ep_probe(struct device *dev)
 			 v);
 	}
 
+	/* Read EP's BAR0 from DBI config space (PEER_DESC source) */
+	{
+		u32 bar_low = rk35_pcie_readl_dbi(pcie->dbi_base, 0x10);
+		u32 bar_high = rk35_pcie_readl_dbi(pcie->dbi_base, 0x14);
+		u64 bar0 = (u64)bar_high << 32 | bar_low;
+		dev_info(dev, "BAR0 (DBI): low=0x%08x high=0x%08x => 0x%llx\n",
+			 bar_low, bar_high, bar0);
+	}
+
 	dev_info(dev, "Mixtile RK35 EP probe: n_free=%u n_win=%u serial=%#x link=%s\n",
 		 ep->n_free, ep->n_win, pcie->serial,
 		 pcie->link_up ? "up" : "down");
 
 	/* DMA self-test: write a minimal descriptor and doorbell.
-	 * Destination = 0x900000000 (RC-assigned peer window base). */
+	 * Try multiple destinations to find a working one. */
 	{
 		struct miop_dma_desc *d = pcie->chan[0].ring;
 		u32 v, r;
@@ -1027,22 +1036,21 @@ static int miop_pcie_ep_probe(struct device *dev)
 		d->len = 8;
 		d->addr_low = (u32)pcie->dma_dma;
 		d->addr_high = 0;
-		*(u64 *)((char *)d + 16) = 0x900000000ULL;
+		*(u64 *)((char *)d + 16) = 0x0ULL; /* dest = 0 (should fail fast) */
 		wmb();
 		d->status = 1;
 		wmb();
 
-		/* Verify register access works */
 		r = readl(pcie->dbi_base + 0x380000);
 		dev_info(dev, "DMA test: 0x380000=0x%08x\n", r);
-		r = readl(pcie->dbi_base + 0x38000C);
-		dev_info(dev, "DMA test: before 0x38000C=0x%08x\n", r);
 
 		writel(1, pcie->dbi_base + 0x38000C);
-		r = readl(pcie->dbi_base + 0x38000C);
-		dev_info(dev, "DMA test: after  0x38000C=0x%08x\n", r);
-
 		writel(0x40000308, pcie->dbi_base + 0x380200);
+		writel(0x40000308, pcie->dbi_base + 0x380300);
+		writel((u32)pcie->chan[0].ring_dma, pcie->dbi_base + 0x38021C);
+		writel((u32)(pcie->chan[0].ring_dma >> 32), pcie->dbi_base + 0x380220);
+		writel((u32)pcie->chan[0].ring_dma, pcie->dbi_base + 0x38031C);
+		writel((u32)(pcie->chan[0].ring_dma >> 32), pcie->dbi_base + 0x380320);
 		dmb(oshst);
 
 		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
@@ -1055,25 +1063,51 @@ static int miop_pcie_ep_probe(struct device *dev)
 		dmb(oshst);
 
 		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
-		dev_info(dev, "DMA test: pre-doorbell 0x380010=0x%08x 0x38000C=0x%08x\n",
-			 v, readl(pcie->dbi_base + 0x38000C));
 		writel((v & ~7) | 0, pcie->dbi_base + 0x380010);
-		r = readl(pcie->dbi_base + 0x380010);
-		r = readl(pcie->dbi_base + 0x38000C);
-		dev_info(dev, "DMA test: post-doorbell 0x380010=0x%08x 0x38000C=0x%08x\n",
-			 readl(pcie->dbi_base + 0x380010), r);
 
 		while (tries < 1000 && (d->status & 1)) {
 			udelay(100);
 			tries++;
 		}
-		dev_info(dev, "DMA self-test: status=%u after %dms "
-			 "0x38000C=0x%08x 0x38004C=0x%08x "
-			 "apb[0x10]=0x%08x\n",
+		dev_info(dev, "DMA self-test dest=0x0: status=%u after %dms "
+			 "0x38000C=0x%08x 0x380010=0x%08x\n",
 			 d->status, tries * 100 / 1000,
-			 readl(pcie->dbi_base + 0x38004C),
-			 readl(pcie->dbi_base + 0x38004C),
-			 readl(pcie->apb_base + 0x10));
+			 readl(pcie->dbi_base + 0x38000C),
+			 readl(pcie->dbi_base + 0x380010));
+
+		/* Try dest = local DDR (0x0e000000 — should loopback) */
+		memset(d, 0, sizeof(*d));
+		d->len = 8;
+		d->addr_low = (u32)pcie->dma_dma;
+		d->addr_high = 0;
+		*(u64 *)((char *)d + 16) = (u64)pcie->dma_dma; /* loopback to same buf */
+		wmb();
+		d->status = 1;
+		wmb();
+
+		writel(1, pcie->dbi_base + 0x38000C);
+		writel(0x40000308, pcie->dbi_base + 0x380200);
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380054);
+		writel(v & ~1u, pcie->dbi_base + 0x380054);
+		dmb(oshst);
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380090);
+		writel(v | 0x10000, pcie->dbi_base + 0x380090);
+		dmb(oshst);
+		writel(0x10001, pcie->dbi_base + 0x380058);
+		dmb(oshst);
+		v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
+		writel((v & ~7) | 0, pcie->dbi_base + 0x380010);
+
+		tries = 0;
+		while (tries < 1000 && (d->status & 1)) {
+			udelay(100);
+			tries++;
+		}
+		dev_info(dev, "DMA self-test dest=local: status=%u after %dms "
+			 "0x38000C=0x%08x 0x380010=0x%08x\n",
+			 d->status, tries * 100 / 1000,
+			 readl(pcie->dbi_base + 0x38000C),
+			 readl(pcie->dbi_base + 0x380010));
 
 		/* Clear self-test descriptor so net driver can use ring[0] */
 		d->status = 0;
