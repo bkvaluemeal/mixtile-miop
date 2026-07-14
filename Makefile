@@ -2,12 +2,10 @@ obj-m += miop-reg.o
 obj-m += miop-ep.o
 obj-m += miop-ep-net.o
 obj-m += pcie-ep-rk35.o
-miop-reg-objs := reg.o meta_reg.o
+miop-reg-objs := reg.o
 miop-ep-objs := ep.o meta_ep.o
 miop-ep-net-objs := net.o meta_net.o
 pcie-ep-rk35-objs := pcie.o meta_pcie.o
-
-CFLAGS_meta_reg.o := -DEXPORT_REG_SYMBOLS
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
