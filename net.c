@@ -93,7 +93,7 @@ static netdev_tx_t miop_ndo_start_xmit(struct sk_buff *skb,
 		return NETDEV_TX_OK;
 	}
 
-	ret = pdrv->dma_submit(pdev, -1, dma, 0, skb->len,
+	ret = pdrv->dma_submit(pdev, -1, dma, dma, skb->len,
 			       (u64)(unsigned long)skb, miop_tx_complete);
 	if (ret) {
 		dma_unmap_single(pdev, dma, skb->len, DMA_TO_DEVICE);

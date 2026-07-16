@@ -546,12 +546,13 @@ static void rk35_dma_start_write(struct miop_pcie *pcie, u32 ch)
 	writel(1, pcie->dbi_base + 0x38000C);
 	dmb(oshst);
 
-	/* 2. Re-program ring address (batch path writes it every time) */
+	/* Re-program control registers and LLP (restart from ring[0]).
+	 * ring[0..1] have len=0 pass-through descriptors so the engine
+	 * zips through them to reach our TX descriptors at higher slots. */
 	writel(0x40000308, pcie->dbi_base + base + 0x200);
 	writel(0,          pcie->dbi_base + base + 0x204);
 	writel((u32)ring_dma, pcie->dbi_base + base + 0x21C);
 	writel((u32)(ring_dma >> 32), pcie->dbi_base + base + 0x220);
-	/* Read-channel registers (interrupt handler also programs these) */
 	writel(0x40000308, pcie->dbi_base + base + 0x300);
 	writel(0,          pcie->dbi_base + base + 0x304);
 	writel((u32)ring_dma, pcie->dbi_base + base + 0x31C);
@@ -572,7 +573,7 @@ static void rk35_dma_start_write(struct miop_pcie *pcie, u32 ch)
 	writel((1u << ch) | (1u << (16 + ch)), pcie->dbi_base + 0x380058);
 	dmb(oshst);
 
-	/* 6. Doorbell — write channel number (bits [2:0] selects channel) */
+	/* 6. Doorbell — write channel number */
 	v = rk35_pcie_readl_dbi(pcie->dbi_base, 0x380010);
 	writel((v & ~7) | ch, pcie->dbi_base + 0x380010);
 }
@@ -600,18 +601,19 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 	unsigned long flags;
 	u16 idx;
 	int p;
+	u32 ch_eff = ch >= MIOP_DMA_NUM_CH ? 0 : ch;
 
-	/* `peer == (u32)-1` broadcasts to every online peer's data window. */
-	if (ch >= MIOP_DMA_NUM_CH)
+	/* `ch == (u32)-1` broadcasts to every online peer's data window. */
+	if (ch >= MIOP_DMA_NUM_CH && ch != (u32)-1)
 		return -EINVAL;
 
-	chan = &pcie->chan[ch];
+	chan = &pcie->chan[ch_eff];
+
+	spin_lock_irqsave(&chan->lock, flags);
 
 	for (p = 0; p < 4; p++) {
 		void __iomem *win;
 		dma_addr_t win_dma;
-		int tries;
-		u32 st;
 
 		if (pcie->peer_data_base[p] == NULL || pcie->peer_data_dma[p] == 0)
 			continue;
@@ -619,13 +621,14 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 		win = pcie->peer_data_base[p];
 		win_dma = pcie->peer_data_dma[p];
 
-		/* Copy the frame into the peer's data window (the eDMA reads
-		 * from here and writes it across the fabric into the peer's
-		 * RX ring). */
-		memcpy_toio(win, (void *)(unsigned long)data, len);
+		/* Copy TX data from the skb (cookie = skb ptr) into the
+		 * staging buffer that feeds the eDMA Read Engine. */
+		if (cookie) {
+			struct sk_buff *skb = (struct sk_buff *)(unsigned long)cookie;
+			memcpy_toio(win, skb->data, len);
+		}
 		wmb();
 
-		spin_lock_irqsave(&chan->lock, flags);
 		idx = chan->prod_idx;
 		desc = &chan->ring[idx];
 		track = &chan->track[idx];
@@ -638,11 +641,13 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 		}
 
 		desc->len       = len;
-		desc->addr_low  = (u32)win_dma;
-		desc->addr_high = (u32)(win_dma >> 32);
-		desc->meta_len  = (u16)ext;
-		desc->meta      = (u16)(ext >> 16);
-		desc->meta2     = (u32)(ext >> 32);
+		/* source = per-peer staging buffer (low DMA addr) */
+		desc->addr_low  = (u32)pcie->peer_data_src[p];
+		desc->addr_high = (u32)((u64)pcie->peer_data_src[p] >> 32);
+		/* destination = translated PCIe address (encoded in metadata) */
+		desc->meta_len  = (u16)pcie->peer_pci_dma[p];
+		desc->meta      = (u16)((u64)pcie->peer_pci_dma[p] >> 16);
+		desc->meta2     = (u32)((u64)pcie->peer_pci_dma[p] >> 32);
 
 		track->cookie = cookie;
 		track->cb     = cb;
@@ -651,52 +656,99 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 		chan->busy[idx] = 1;
 
 		wmb();
-		desc->status = ((idx + 1) & 1) | 0x8;
+		desc->status = 0x9;  /* CB=1, INT_STATUS on completion */
 		wmb();
-
-		{
-			struct miop_dma_desc *next =
-				&chan->ring[(idx + 1) & (MIOP_DMA_RING_SIZE - 1)];
-			next->status = ((idx + 2) & 1);
-			wmb();
-		}
 
 		chan->prod_idx = (idx + 1) & (MIOP_DMA_RING_SIZE - 1);
 
-		*(u32 *)((char *)chan->ring +
-			 MIOP_DMA_RING_SIZE * sizeof(struct miop_dma_desc) + 4) =
-			chan->prod_idx;
+		/* DMA-based doorbell: submit a 4-byte descriptor that
+		 * writes the doorbell value to PEER_ELBI on the fabric. */
+		if (pcie->peer_db_buf[p]) {
+			u64 peer_elbi = pcie->peer_pci_elbi[p];
+			idx = chan->prod_idx;
+			desc = &chan->ring[idx];
+			track = &chan->track[idx];
+
+			desc->len       = 4;
+			/* source = doorbell value buffer */
+			desc->addr_low  = (u32)pcie->peer_db_buf[p];
+			desc->addr_high = (u32)((u64)pcie->peer_db_buf[p] >> 32);
+			/* destination = PEER_ELBI (translated PCIe address) */
+			desc->meta_len  = (u16)peer_elbi;
+			desc->meta      = (u16)(peer_elbi >> 16);
+			desc->meta2     = (u32)(peer_elbi >> 32);
+
+			track->cookie = 0;
+			track->cb     = NULL;
+			track->dma    = 0;
+			track->len    = 4;
+			chan->busy[idx] = 1;
+
+			wmb();
+			/* Doorbell is the last descriptor — IOC set for
+			 * completion signalling. */
+			desc->status = 0x9;
+			wmb();
+
+			/* Terminator: next descriptor has CB=0 */
+			{
+				struct miop_dma_desc *next =
+					&chan->ring[(idx + 1) & (MIOP_DMA_RING_SIZE - 1)];
+				next->status = 0x0;
+				wmb();
+			}
+
+			chan->prod_idx = (idx + 1) & (MIOP_DMA_RING_SIZE - 1);
+
+			*(u32 *)((char *)chan->ring +
+				 MIOP_DMA_RING_SIZE * sizeof(struct miop_dma_desc) + 4) =
+				chan->prod_idx;
+			wmb();
+		}
+	}
+
+	/* Terminator: clear the entire descriptor at the next slot */
+	{
+		u16 term_idx = chan->prod_idx;
+		memset(&chan->ring[term_idx], 0, sizeof(struct miop_dma_desc));
 		wmb();
-		spin_unlock_irqrestore(&chan->lock, flags);
+	}
 
-		rk35_dma_start_write(pcie, ch);
+	/* Write tail pointer for the final producer index */
+	*(u32 *)((char *)chan->ring +
+		 MIOP_DMA_RING_SIZE * sizeof(struct miop_dma_desc) + 4) =
+		chan->prod_idx;
+	wmb();
 
-		/* Notify the peer its RX doorbell is pending. */
-		if (pcie->peer_db_base[p])
-			miop_raise_peer_irq(dev, p, 1);
+	spin_unlock_irqrestore(&chan->lock, flags);
 
-		/* Poll for eDMA completion before reusing the window / freeing
-		 * the skb (keeps the source buffer alive until the write lands). */
-		tries = 1000;
+	if (pcie->peer_data_base[0] == NULL && pcie->peer_data_base[1] == NULL) {
+		dev_kfree_skb((struct sk_buff *)(unsigned long)cookie);
+		return -ENODEV;
+	}
+
+	/* Trigger DMA once for all submitted descriptors */
+	rk35_dma_start_write(pcie, ch_eff);
+
+	/* Poll for eDMA completion */
+	{
+		u32 st;
+		int tries = 1000;
 		do {
 			st = readl(pcie->dbi_base + 0x38004C);
-			if (st & ((1u << ch) | (1u << (ch + 16))))
+			if (st & ((1u << ch_eff) | (1u << (ch_eff + 16))))
 				break;
 			cpu_relax();
 			udelay(10);
 		} while (--tries);
 
-		if (!(st & ((1u << ch) | (1u << (ch + 16)))))
-			dev_err(pcie->dev, "dma_submit ch=%u peer=%d NOT done "
-				"0x38004C=0x%08x\n", ch, p, st);
+		if (!(st & ((1u << ch_eff) | (1u << (ch_eff + 16)))))
+			dev_err(pcie->dev, "dma_submit ch=%u NOT done "
+				"0x38004C=0x%08x\n", ch, st);
 		else
-			miop_dma_try_reap(pcie, ch);
+			miop_dma_try_reap(pcie, ch_eff);
 	}
 
-	if (pcie->peer_data_base[0] == NULL && pcie->peer_data_base[1] == NULL)
-		return -ENODEV;
-	/* Free the skb once; it was copied into each peer window above and the
-	 * eDMA reads have completed (we polled per peer). */
 	dev_kfree_skb((struct sk_buff *)(unsigned long)cookie);
 	return 0;
 }
@@ -1110,6 +1162,15 @@ static void miop_pcie_bar_check_work(struct work_struct *work)
 		}
 
 		if (readl(pcie->dbi_base + 0x38004C) & 1) {
+			/* Clear the self-test descriptor AND its terminator
+			 * (ring[1]) — both were left with CB values that
+			 * block the eDMA walk from reaching new descriptors
+			 * placed at higher ring indices.  Replace them with
+			 * len=0 pass-through descriptors (instant process). */
+			memset(&pcie->chan[0].ring[0], 0, 2 * sizeof(struct miop_dma_desc));
+			pcie->chan[0].ring[0].status = 0x9;
+			pcie->chan[0].ring[1].status = 0x9;
+			wmb();
 			dev_info(dev, "DMA self-test: PASS (INT=0x%08x)\n",
 				 readl(pcie->dbi_base + 0x38004C));
 			writel(1, pcie->dbi_base + 0x380058);
@@ -1305,56 +1366,67 @@ static int miop_pcie_ep_probe(struct device *dev)
 		miop_elbi_enable_irq(pcie, i);
 	}
 
-	/* Per-peer TX data window + RX doorbell window, one per destination node.
-	 * The factory encodes the address as 0x90000000 + (DEST_NODE<<24) +
-	 * (SRC_NODE<<20) + offset, where SRC_NODE is THIS node's id.  A node
-	 * listens for incoming data at 0x90<SRC_NODE>000000: node1->node2 data
-	 * lands at 0x903000000, node2->node1 at 0x901000000, node3 receives at
-	 * 0x903000000.  So node3 writing to node1 uses 0x903000000 and doorbell
-	 * 0x9000c0000. */
-	/* Per-peer window: ONE outbound iATU window per peer index (0..3),
-	 * mirroring the factory's miop_rk35_map_peer_bar.  The factory maps the
-	 * peer's listening region at target 0x90000000 + (peer<<25); we do the
-	 * same (outbound iATU identity-map + ioremap) so a write into the window
-	 * crosses the fabric to the peer's RX region.  Derive the RX doorbell
-	 * (+0x20, from miop_raise_peer_irq) and TX data (+0x100000) from it. */
 	dev_info(dev, "PEERMAP n_free=%lu n_win=%lu\n", ep->n_free, ep->n_win);
 
 	for (i = 0; i < 4; i++) {
 		u64 out_phys = 0;
 		void *va;
-		/* peer 0 is this node's own region; only TX to peers 1..3. */
-		if (i == 0)
+		/* Skip self (node id 2 for node2). Peer 0 = node3 (10.20.0.4),
+		 * peer 1 = node1 (10.20.0.1), peer 2 = self. */
+		if (i == 2)
 			continue;
-		/* Node p listens for RX data at 0x90000000 + (p<<24) + (SRC<<20),
-		 * where SRC is THIS node's id (3).  Confirmed by node1's factory
-		 * boot: its TX to node2 (peer[1]) uses BAR window 0x903000000
-		 * (= 0x90000000 + 2<<24 + 1<<20), i.e. the SENDER's id is in the
-		 * +20 byte.  So node3(src=3) -> node1 = 0x901000000,
-		 * node3 -> node2 = 0x902000000. */
-		u64 data_target = 0x900000000ULL + ((u64)i << 24) + (3ULL << 20);
-		/* RX doorbell register window: 0x90000000 + peer<<24 + 0x100000
-		 * (node1's doorbell is 0x900080000, node2's 0x9000c0000). */
-		u64 db_target = 0x90000000ULL + ((u64)i << 24) + 0x100000ULL;
+		/* Program the iATU w/ correct PEER_DESC addresses.
+		 * peer_data_base gets a local DMAM buffer so the
+		 * TX path can run.  The CPU writes the skb data into
+		 * this buffer, then the eDMA engine reads it and
+		 * writes it to peer_data_dma (PEER_DESC on fabric). */
+		{
+			u64 peer_desc = 0x900000000ULL + 0x20000 +
+					(u64)i * 0x40000;
+			u64 peer_elbi = peer_desc + 0x20000;
+			/* Data iATU: BAR0_base + offset.
+			 * On node3: BAR0=0x24000000, OFFSET=0x01D60000+desc_lo.
+			 * Doorbell iATU: BAR4_base + elbi_lo.
+			 * On node3: BAR4=0x23000000. */
+			u64 pci_target = (i == 0 || i == 1 || i == 3) ?
+				(0x24000000ULL + 0x1D60000ULL +
+				 (peer_desc & 0x00FFFFFFULL)) : peer_desc;
+			u64 pci_elbi = (i == 0 || i == 1 || i == 3) ?
+				(0x23000000ULL + (peer_elbi & 0x00FFFFFFULL)) : 0;
+			if (miop_ep_map_outbound_atu(pcie, pci_target,
+						     0x40000, 0))
+				dev_warn(dev, "peer=%d iATU data window failed\n", i);
+			if (miop_ep_map_outbound_atu(pcie, pci_elbi,
+						     0x2000, 0))
+				dev_warn(dev, "peer=%d iATU doorbell failed\n", i);
+			pcie->peer_pci_dma[i]   = (dma_addr_t)pci_target;
+			pcie->peer_pci_elbi[i]  = (dma_addr_t)pci_elbi;
+			va = dmam_alloc_coherent(dev, 2048, &out_phys,
+						 GFP_KERNEL);
+			pcie->peer_data_base[i] = va ? (void __iomem *)va : NULL;
+			pcie->peer_data_dma[i]  = (dma_addr_t)peer_desc;
+			pcie->peer_data_src[i]  = (dma_addr_t)out_phys;
 
-		va = miop_map_peer_bar(pcie, data_target, 0x3000000, &out_phys);
-		if (!va) {
-			dev_warn(dev, "map_peer_bar peer=%d data failed\n", i);
-			pcie->peer_data_base[i] = NULL;
-			pcie->peer_data_dma[i] = 0;
-		} else {
-			pcie->peer_data_base[i] = (char __iomem *)va + 0x2000000;
-			pcie->peer_data_dma[i]  = (dma_addr_t)(out_phys + 0x2000000);
+			/* Doorbell buffer: 4-byte DMA buffer with the
+			 * doorbell value (0x2 = RX_DATA, bits[8:15] = src).
+			 * The src peer ID is set from the peer index for
+			 * now; the controller decodes the sender from it. */
+			{
+				void *db_buf;
+				dma_addr_t db_dma;
+				u32 dv = 0x2 | ((i & 0xff) << 8);
+				db_buf = dmam_alloc_coherent(dev, 4, &db_dma,
+							     GFP_KERNEL);
+				if (db_buf) {
+					memcpy(db_buf, &dv, 4);
+					pcie->peer_db_buf[i] = db_dma;
+				} else {
+					pcie->peer_db_buf[i] = 0;
+				}
+			}
 		}
-
-		/* Separate window for the RX doorbell register. */
-		pcie->peer_db_base[i] = miop_map_peer_bar(pcie, db_target,
-							  0x1000, &out_phys);
+		pcie->peer_db_base[i] = NULL;
 		pcie->peer_db_off[i]  = 0;
-
-		dev_info(dev, "peer[%d] data=0x%llx db=0x%llx\n", i,
-			 (unsigned long long)data_target,
-			 (unsigned long long)db_target);
 	}
 
 	/* Request EP IRQ BEFORE the second APB write + link training poll,
