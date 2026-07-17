@@ -345,11 +345,11 @@ static void miop_pcie_resize_bars(struct miop_pcie *pcie)
 	}
 	dev_info(pcie->dev, "REBAR capability at dbi+0x%x\n", rebar_off);
 
-	/* BAR0: 32MB, 32-bit memory */
+	/* BAR0: 32MB, 32-bit prefetchable memory */
 	bar = 0;
 	writel(0x40,  dbi + rebar_off + 0x4 + bar * 8);
 	writel(0x5c0, dbi + rebar_off + 0x8 + bar * 8);
-	writel(PCI_BASE_ADDRESS_MEM_TYPE_32, dbi + 0x10 + bar * 4);
+	writel(PCI_BASE_ADDRESS_MEM_PREFETCH | PCI_BASE_ADDRESS_MEM_TYPE_32, dbi + 0x10 + bar * 4);
 	writel(0, dbi + 0x14);
 
 	/* BAR1: disabled — needed since BAR0 was 64-bit in gateware */
