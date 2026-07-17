@@ -228,10 +228,12 @@ int miop_ep_map_outbound_atu(struct miop_pcie *pcie, u64 target, u32 size, u32 e
 	}
 
 	win = (char *)pcie->atu_base + (bit << 9);
-	/* Register layout transcribed from the factory miop_ep_map_outbound_atu
-	 * (pcie_asm.S:1116-1162): target at +0x8/+0xc, limit at +0x10/+0x20,
-	 * size at +0x14/+0x18, control(enable) at +0x4.  The source/base (+0x0)
-	 * is left 0; the factory relies on target+limit+size alone. */
+	/* Source/base (+0x0): the offset within the outbound region
+	 * (0x900000000 from DT ranges) where the translation starts.
+	 * Accesses to phys 0x900000000 + source get translated to
+	 * target + offset (where offset = phys - 0x900000000 - source).
+	 * Setting source to the PEER_DESC offset means writing to the
+	 * exact PEER_DESC physical address gets PCIe addr = target. */
 	writel(t_lo, (char *)win + 0x8);          /* target lower */
 	writel(t_hi, (char *)win + 0xc);          /* target upper */
 	writel((u32)(limit & 0xffffffff), (char *)win + 0x10);   /* limit lower */
@@ -252,8 +254,11 @@ int miop_ep_map_outbound_atu(struct miop_pcie *pcie, u64 target, u32 size, u32 e
 
 	dev_err(pcie->dev, "outbound ATU enable timeout (win %lu)\n", bit);
 enabled:
-	dev_err(pcie->dev, "outbound free_win %lu target %#llx size %#x\n",
-		bit, (unsigned long long)target, size);
+	dev_err(pcie->dev, "outbound free_win %lu target %#llx size %#x "
+		"src=%08x ctrl=%08x limit_lo=%08x\n",
+		bit, (unsigned long long)target, size,
+		readl((char *)win + 0x0), readl((char *)win + 0x4),
+		readl((char *)win + 0x10));
 
 	set_bit(bit, pcie->map2);
 	pcie->addrs[bit] = target;
@@ -293,6 +298,85 @@ void *miop_map_peer_bar(struct miop_pcie *pcie, u64 target, u32 size, u64 *out_p
 }
 EXPORT_SYMBOL(miop_map_peer_bar);
 
+/* REBAR (Resizable BAR) constants */
+#define PCI_EXT_CAP_ID_REBAR		0x15
+#define PCI_CFG_SPACE_SIZE		256
+#define PCI_CFG_SPACE_EXP_SIZE		4096
+#define PCI_EXT_CAP_ID(hdr)		((hdr) & 0x0000ffff)
+#define PCI_EXT_CAP_NEXT(hdr)		(((hdr) >> 20) & 0xffc)
+#define PCIE_TYPE0_HDR_DBI2_OFFSET	0x100000
+#define PCI_BASE_ADDRESS_0		0x10
+#define PCI_BASE_ADDRESS_MEM_TYPE_32	0x0
+#define PCI_BASE_ADDRESS_MEM_TYPE_64	0x4
+#define PCI_BASE_ADDRESS_MEM_PREFETCH	0x8
+
+static int miop_pci_find_ext_capability(void __iomem *dbi, int cap)
+{
+	u32 header;
+	int ttl;
+	int pos = PCI_CFG_SPACE_SIZE;
+
+	ttl = (PCI_CFG_SPACE_EXP_SIZE - PCI_CFG_SPACE_SIZE) / 8;
+	header = readl(dbi + pos);
+	if (header == 0)
+		return 0;
+	while (ttl-- > 0) {
+		if (PCI_EXT_CAP_ID(header) == cap)
+			return pos;
+		pos = PCI_EXT_CAP_NEXT(header);
+		if (pos < PCI_CFG_SPACE_SIZE)
+			break;
+		header = readl(dbi + pos);
+		if (!header)
+			break;
+	}
+	return 0;
+}
+
+static void miop_pcie_resize_bars(struct miop_pcie *pcie)
+{
+	void __iomem *dbi = pcie->dbi_base;
+	int rebar_off = miop_pci_find_ext_capability(dbi, PCI_EXT_CAP_ID_REBAR);
+	int bar;
+
+	if (!rebar_off) {
+		dev_warn(pcie->dev, "REBAR capability not found\n");
+		return;
+	}
+	dev_info(pcie->dev, "REBAR capability at dbi+0x%x\n", rebar_off);
+
+	/* BAR0: 32MB, 32-bit memory */
+	bar = 0;
+	writel(0x40,  dbi + rebar_off + 0x4 + bar * 8);
+	writel(0x5c0, dbi + rebar_off + 0x8 + bar * 8);
+	writel(PCI_BASE_ADDRESS_MEM_TYPE_32, dbi + 0x10 + bar * 4);
+	writel(0, dbi + 0x14);
+
+	/* BAR1: disabled — needed since BAR0 was 64-bit in gateware */
+	bar = 1;
+	writel(0x10, dbi + rebar_off + 0x4 + bar * 8);
+	writel(0xc0, dbi + rebar_off + 0x8 + bar * 8);
+	writel(0, dbi + 0x10 + bar * 4);
+
+	/* BAR4: 1MB, 32-bit memory (required by controller's miop driver) */
+	bar = 4;
+	writel(0x10, dbi + rebar_off + 0x4 + bar * 8);
+	writel(0xc0, dbi + rebar_off + 0x8 + bar * 8);
+	writel(PCI_BASE_ADDRESS_MEM_TYPE_32, dbi + 0x10 + bar * 4);
+	writel(0, dbi + 0x10 + bar * 4 + 4);
+
+	/* Resize BAR2 through REBAR to minimum, then disable */
+	bar = 2;
+	writel(0x10, dbi + rebar_off + 0x4 + bar * 8);
+	writel(0xc0, dbi + rebar_off + 0x8 + bar * 8);
+	writel(0, dbi + 0x10 + bar * 4);
+	/* BAR3 paired with BAR2 (64-bit), also disabled */
+	writel(0, dbi + 0x10 + 3 * 4);
+
+	/* Disable BAR5 in standard config */
+	writel(0, dbi + 0x10 + 5 * 4);
+}
+
 /*
  * miop_pcie_ep_set_bar() - program one EP BAR. Transcribed from pcie.S
  * rk35_pcie_ep_set_bar.isra.0. The original ran on the vendor's struct
@@ -311,40 +395,44 @@ static void miop_pcie_ep_set_bar(struct miop_pcie *pcie, int bar,
 {
 	void __iomem *dbi = pcie->dbi_base;
 	void __iomem *apb = pcie->apb_base;
-	u32 base_idx = pcie->ep->n_win;	/* rockchip_pcie+0x20 guess */
-	u32 bi  = base_idx + bar * 8;		/* BAR register index offset */
+	/* DWC EP internal BAR registers (resbar_base=0 for RK3588).
+	 * Each BAR occupies 8 bytes: +0 upper, +4 lower, +8 size/ctrl.
+	 * Standard PCIe BAR at dbi+(bar+4)*4 gets flags only. */
+	u32 int_off  = bar * 8;			/* internal BAR offset */
+	u32 std_off  = 0x10 + bar * 4;		/* standard PCIe BAR */
 	u32 apo = (bar + 4) * 4;		/* APB 64-bit shadow offset */
 	u32 sz_enc;
 
-	/* BAR lower / size field (asm: *(D + BI + 4) = 0; *(D + BI + 8) = size) */
-	writel(0, dbi + bi + 4);
+	/* Internal BAR: clear upper 32 bits */
+	writel(0, dbi + int_off + 4);
 	if (size > 0xfffff) {
-		/* size encoding: clz(rbit(size)) - 20, placed at bits[12:8].
-		 * clz(rbit(x)) == ffs(x)-1, so this is (ffs(size)-21) & 0x1f. */
 		sz_enc = ((ffs((u32)size) - 1 - 0x14) & 0x1f) << 8;
-		writel(sz_enc, dbi + bi + 8);
+		writel(sz_enc, dbi + int_off + 8);
 	} else {
-		writel(0, dbi + bi + 8);
+		writel(0, dbi + int_off + 8);
 	}
 
-	/* 64-bit BAR: clear the upper shadow (asm: flags & 0x4). */
+	/* 64-bit BAR: clear internal upper shadow */
 	if (flags & 0x4) {
 		writel(0, apb + apo + 4);
-		writel(0, dbi + bi + 12);
-		writel(0, dbi + bi + 16);
+		writel(0, dbi + int_off + 12);
+		writel(0, dbi + int_off + 16);
 	}
 
+	/* APB shadow: write size-1 */
 	if (size != 0)
-		writel(0, apb + apo);			/* BAR lower (APB shadow) */
+		writel(size - 1, apb + apo);
+	else
+		writel(0, apb + apo);
 
-	/* BAR type/flags (asm: *(D + BI) = flags; if !64-bit also clear +4). */
-	writel(flags, dbi + bi);
+	/* Standard PCIe BAR: write flags only */
+	writel(flags, dbi + std_off);
 	if (!(flags & 0x4))
-		writel(0, dbi + bi + 4);
+		writel(0, dbi + std_off + 4);
 
 	dev_info(pcie->dev,
-		 "set_bar(bar=%d size=%#llx flags=%#x) bi=%#x [transcribed]\n",
-		 bar, size, flags, bi);
+		 "set_bar(bar=%d size=%#llx flags=%#x) int=%#x std=%#x\n",
+		 bar, size, flags, int_off, std_off);
 }
 
 /*
@@ -439,14 +527,12 @@ static void miop_pcie_config_controller(struct miop_pcie *pcie,
 	}
 	writel(v, dbi + 0x80c);
 
-	writel(6, dbi + 0x4);
-
 	/* Controller enable (0x8bc |= 1) BEFORE programming config/IDs/BARs */
 	v = rk35_pcie_readl_dbi(dbi, 0x8bc);
 	writel(v | 0x1, dbi + 0x8bc);
 
-	/* set_bar x4 (EP BARs) — inside the enabled window, before IDs */
-	miop_pcie_ep_set_bar(pcie, 0, 0x10000, 0x8); /* 64K, 32-bit prefetch — might fit controller's bridge */
+	/* Resize BARs through the PCIe REBAR extended capability */
+	miop_pcie_resize_bars(pcie);
 	miop_pcie_ep_set_bar(pcie, 2, 0, 0);
 	miop_pcie_ep_set_bar(pcie, 3, 0, 0);
 	miop_pcie_ep_set_bar(pcie, 4, 0x100000, 0xc);
@@ -483,6 +569,8 @@ static void miop_pcie_peer_online(struct miop_pcie *pcie)
 	struct miop_ep *ep = pcie->ep;
 	struct miop_ep_net_driver *net = ep->net_drv;
 	int i;
+
+	miop_ep_map_outbound_atu(pcie, 0x02CC0000ULL, 0x140000, 0);
 
 	if (!net || !net->on_peer_online)
 		return;
@@ -611,23 +699,39 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 
 	spin_lock_irqsave(&chan->lock, flags);
 
-	for (p = 0; p < 4; p++) {
-		void __iomem *win;
-		dma_addr_t win_dma;
+	for (p = 0; p < 3; p++) {
+		void __iomem *swin;
+		dma_addr_t swin_dma;
+		u32 desc_len;
 
 		if (pcie->peer_data_base[p] == NULL || pcie->peer_data_dma[p] == 0)
 			continue;
 
-		win = pcie->peer_data_base[p];
-		win_dma = pcie->peer_data_dma[p];
+		swin = pcie->peer_data_base[p];
+		swin_dma = pcie->peer_data_dma[p];
 
-		/* Copy TX data from the skb (cookie = skb ptr) into the
-		 * staging buffer that feeds the eDMA Read Engine. */
+		/* Build software descriptor (controller-readable format)
+		 * at the start of the staging buffer:
+		 *   +0  status  = 0x1 (CB)
+		 *   +4  len     = packet length
+		 *   +8  data    = PEER_DESC + 24 (inline data addr)
+		 *  +16  ext     = same as data (matching factory)
+		 *  +24 …        = inline packet data */
 		if (cookie) {
 			struct sk_buff *skb = (struct sk_buff *)(unsigned long)cookie;
-			memcpy_toio(win, skb->data, len);
+			u64 inline_addr = pcie->peer_pci_dma[p] + 24;
+			u32 *hdr = (u32 *)swin;
+
+			hdr[0] = 0x1;			/* CB */
+			hdr[1] = (u32)len;		/* packet len */
+			memcpy_toio((char *)swin + 8,  &inline_addr, 8);
+			memcpy_toio((char *)swin + 16, &inline_addr, 8);
+			memcpy_toio((char *)swin + 24, skb->data, len);
+			wmb();
+			desc_len = 24 + (u32)len;
+		} else {
+			desc_len = (u32)len;
 		}
-		wmb();
 
 		idx = chan->prod_idx;
 		desc = &chan->ring[idx];
@@ -640,11 +744,11 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 			track = &chan->track[idx];
 		}
 
-		desc->len       = len;
-		/* source = per-peer staging buffer (low DMA addr) */
+		desc->len       = desc_len;
+		/* source = staging buffer (descriptor + inline data) */
 		desc->addr_low  = (u32)pcie->peer_data_src[p];
 		desc->addr_high = (u32)((u64)pcie->peer_data_src[p] >> 32);
-		/* destination = translated PCIe address (encoded in metadata) */
+		/* destination = PEER_DESC (inbound BAR0 region) */
 		desc->meta_len  = (u16)pcie->peer_pci_dma[p];
 		desc->meta      = (u16)((u64)pcie->peer_pci_dma[p] >> 16);
 		desc->meta2     = (u32)((u64)pcie->peer_pci_dma[p] >> 32);
@@ -652,7 +756,7 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 		track->cookie = cookie;
 		track->cb     = cb;
 		track->dma    = (dma_addr_t)data;
-		track->len    = len;
+		track->len    = desc_len;
 		chan->busy[idx] = 1;
 
 		wmb();
@@ -661,8 +765,7 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 
 		chan->prod_idx = (idx + 1) & (MIOP_DMA_RING_SIZE - 1);
 
-		/* DMA-based doorbell: submit a 4-byte descriptor that
-		 * writes the doorbell value to PEER_ELBI on the fabric. */
+		/* DMA-based doorbell: write doorbell value to PEER_ELBI */
 		if (pcie->peer_db_buf[p]) {
 			u64 peer_elbi = pcie->peer_pci_elbi[p];
 			idx = chan->prod_idx;
@@ -673,7 +776,7 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 			/* source = doorbell value buffer */
 			desc->addr_low  = (u32)pcie->peer_db_buf[p];
 			desc->addr_high = (u32)((u64)pcie->peer_db_buf[p] >> 32);
-			/* destination = PEER_ELBI (translated PCIe address) */
+			/* destination = PEER_ELBI */
 			desc->meta_len  = (u16)peer_elbi;
 			desc->meta      = (u16)(peer_elbi >> 16);
 			desc->meta2     = (u32)(peer_elbi >> 32);
@@ -685,12 +788,9 @@ static int miop_rk35_dma_submit(struct device *dev, u32 ch, u64 data,
 			chan->busy[idx] = 1;
 
 			wmb();
-			/* Doorbell is the last descriptor — IOC set for
-			 * completion signalling. */
 			desc->status = 0x9;
 			wmb();
 
-			/* Terminator: next descriptor has CB=0 */
 			{
 				struct miop_dma_desc *next =
 					&chan->ring[(idx + 1) & (MIOP_DMA_RING_SIZE - 1)];
@@ -1097,14 +1197,12 @@ static void miop_pcie_bar_check_work(struct work_struct *work)
 		u32 r;
 		int tries = 0;
 
-		/* --- DMA self-test: one write-descriptor to the peer ---------
+		/* --- DMA self-test: one write-descriptor to local DMA buffer ---------
 		 * Validates that the DesignWare eDMA write engine is correctly
-		 * programmed and can move a descriptor to completion.  Uses the
-		 * same LLI + Cycle Bit protocol as the production TX path. */
-		if (peer_addr > 0x100000000ULL && peer_addr < 0x10000000000ULL)
-			dest_addr = peer_addr;
-		else
-			dest_addr = 0x9000e0000ULL;
+		 * programmed and can move a descriptor to completion.  Writes to
+		 * a safe local DMA buffer (NOT through iATU) to avoid corrupting
+		 * controller memory. */
+		dest_addr = pcie->dma_dma + 0x200000; /* safe local buffer */
 
 		memset(d, 0, sizeof(*d));
 		d->len = 8;
@@ -1293,7 +1391,10 @@ static int miop_pcie_ep_probe(struct device *dev)
 		}
 	}
 
-	/* Controller / DLL configuration (DBI/APB pokes). */
+	/* Controller / DLL configuration (DBI/APB pokes).
+	 * Restored: necessary because the factory module is rmmod'ed
+	 * before our module loads.  BARs must be re-configured.
+	 * The base_idx=0x10 writes standard PCIe BAR0 (dbi+0x10). */
 	miop_pcie_config_controller(pcie, ep);
 
 	/* Program per-channel DMA ring address + descriptor config into the
@@ -1371,40 +1472,38 @@ static int miop_pcie_ep_probe(struct device *dev)
 	for (i = 0; i < 4; i++) {
 		u64 out_phys = 0;
 		void *va;
-		/* Skip self (node id 2 for node2). Peer 0 = node3 (10.20.0.4),
-		 * peer 1 = node1 (10.20.0.1), peer 2 = self. */
-		if (i == 2)
-			continue;
-		/* Program the iATU w/ correct PEER_DESC addresses.
-		 * peer_data_base gets a local DMAM buffer so the
-		 * TX path can run.  The CPU writes the skb data into
-		 * this buffer, then the eDMA engine reads it and
-		 * writes it to peer_data_dma (PEER_DESC on fabric). */
+		/* Program one iATU window covering the entire
+		 * PEER_DESC region (0x20000–0x11FFFF within the
+		 * outbound region at 0x900000000, DT ranges #2).
+		 * With source=0, the iATU translates any access
+		 * at phys 0x900000000+offset to PCIe target+offset.
+		 * One window at target=0x02cc0000,size=0x100000
+		 * covers all 4 × (PEER_DESC + PEER_ELBI).
+		 * eDMA writes to PEER_DESC/PEER_ELBI physical
+		 * addresses directly; the iATU translates them
+		 * to the fabric at the correct PCIe offset. */
 		{
-			u64 peer_desc = 0x900000000ULL + 0x20000 +
-					(u64)i * 0x40000;
-			u64 peer_elbi = peer_desc + 0x20000;
-			/* Data iATU: BAR0_base + offset.
-			 * On node3: BAR0=0x24000000, OFFSET=0x01D60000+desc_lo.
-			 * Doorbell iATU: BAR4_base + elbi_lo.
-			 * On node3: BAR4=0x23000000. */
-			u64 pci_target = (i == 0 || i == 1 || i == 3) ?
-				(0x24000000ULL + 0x1D60000ULL +
-				 (peer_desc & 0x00FFFFFFULL)) : peer_desc;
-			u64 pci_elbi = (i == 0 || i == 1 || i == 3) ?
-				(0x23000000ULL + (peer_elbi & 0x00FFFFFFULL)) : 0;
-			if (miop_ep_map_outbound_atu(pcie, pci_target,
-						     0x40000, 0))
-				dev_warn(dev, "peer=%d iATU data window failed\n", i);
-			if (miop_ep_map_outbound_atu(pcie, pci_elbi,
-						     0x2000, 0))
-				dev_warn(dev, "peer=%d iATU doorbell failed\n", i);
-			pcie->peer_pci_dma[i]   = (dma_addr_t)pci_target;
-			pcie->peer_pci_elbi[i]  = (dma_addr_t)pci_elbi;
+			/* PEER_DESC/PEER_ELBI in the OUTBOUND iATU
+			 * region at phys 0x900000000+.  Source=0,
+			 * target=0x02CC0000.  eDMA writes to these
+			 * physical addresses; iATU translates to PCIe.
+			 *
+			 * PEER_DESC[p] = 0x900000000 + 0x20000 + p*0x40000
+			 * PEER_ELBI[p] = 0x900000000 + 0x40000 + p*0x40000 */
+			if (i >= 3)
+				continue;
+			u64 peer_desc_phys = 0x900000000ULL + 0x20000ULL +
+					     (u64)i * 0x40000ULL;
+			u64 peer_elbi_phys = 0x900000000ULL + 0x40000ULL +
+					     (u64)i * 0x40000ULL;
+			/* eDMA destinations: PEER_DESC/PEER_ELBI
+			 * physical addresses within the iATU region. */
+			pcie->peer_pci_dma[i]   = (dma_addr_t)peer_desc_phys;
+			pcie->peer_pci_elbi[i]  = (dma_addr_t)peer_elbi_phys;
 			va = dmam_alloc_coherent(dev, 2048, &out_phys,
 						 GFP_KERNEL);
 			pcie->peer_data_base[i] = va ? (void __iomem *)va : NULL;
-			pcie->peer_data_dma[i]  = (dma_addr_t)peer_desc;
+			pcie->peer_data_dma[i]  = (dma_addr_t)peer_desc_phys;
 			pcie->peer_data_src[i]  = (dma_addr_t)out_phys;
 
 			/* Doorbell buffer: 4-byte DMA buffer with the
@@ -1444,21 +1543,35 @@ static int miop_pcie_ep_probe(struct device *dev)
 			dev_info(dev, "requested EP IRQ %d\n", ep->hw.irq);
 	}
 
-	/* APB glue second write: after IRQ request, factory writes
-	 * apb[0x180]=0x100010 apb[0]=0xf00000 apb[0]=0xc000c
-	 * (pcie_asm.S:2742-2754).  These trigger link-training LTSSM. */
-	if (pcie->apb_base) {
-		writel(0x100010, pcie->apb_base + 0x180);
-		writel(0xf00000, pcie->apb_base);
-		writel(0xc000c,  pcie->apb_base);
-		dev_info(pcie->dev,
-			 "apb[0x180]=%08x apb[0]=%08x\n",
-			 readl(pcie->apb_base + 0x180),
-			 readl(pcie->apb_base));
+	/* Check if link is already up (factory module from initramfs may
+	 * have already trained it).  If the link is up, skip APB glue
+	 * writes and link training to avoid resetting the established
+	 * link and breaking the controller's probe. */
+	{
+		u32 ltssm = 0;
+		if (pcie->apb_base)
+			ltssm = readl(pcie->apb_base + 0x300);
+		if ((ltssm & 0x3f) == 0x11 && ((ltssm >> 16) & 0x3) == 0x3) {
+			pcie->link_up = 1;
+			dev_info(dev, "PCIe Link already up (LTSSM %#x)\n", ltssm);
+			miop_pcie_peer_online(pcie);
+		} else {
+			/* APB glue second write: after IRQ request,
+			 * factory writes apb[0x180]=0x100010
+			 * apb[0]=0xf00000 apb[0]=0xc000c */
+			if (pcie->apb_base) {
+				writel(0x100010, pcie->apb_base + 0x180);
+				writel(0xf00000, pcie->apb_base);
+				writel(0xc000c,  pcie->apb_base);
+				dev_info(pcie->dev,
+					 "apb[0x180]=%08x apb[0]=%08x\n",
+					 readl(pcie->apb_base + 0x180),
+					 readl(pcie->apb_base));
+			}
+			/* Bounded link-training poll. */
+			miop_pcie_link_train(pcie);
+		}
 	}
-
-	/* Bounded link-training poll. */
-	miop_pcie_link_train(pcie);
 
 	/* DMA engine init after link training (factory does this in the
 	 * interrupt handler). Keep the ring-address/DBI register writes
