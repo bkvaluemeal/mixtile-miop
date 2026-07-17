@@ -345,35 +345,29 @@ static void miop_pcie_resize_bars(struct miop_pcie *pcie)
 	}
 	dev_info(pcie->dev, "REBAR capability at dbi+0x%x\n", rebar_off);
 
-	/* BAR0: 32MB, 32-bit prefetchable memory */
+	/* BAR0: 32MB prefetchable */
 	bar = 0;
 	writel(0x40,  dbi + rebar_off + 0x4 + bar * 8);
 	writel(0x5c0, dbi + rebar_off + 0x8 + bar * 8);
 	writel(PCI_BASE_ADDRESS_MEM_PREFETCH | PCI_BASE_ADDRESS_MEM_TYPE_32, dbi + 0x10 + bar * 4);
 	writel(0, dbi + 0x14);
 
-	/* BAR1: disabled — needed since BAR0 was 64-bit in gateware */
-	bar = 1;
-	writel(0x10, dbi + rebar_off + 0x4 + bar * 8);
-	writel(0xc0, dbi + rebar_off + 0x8 + bar * 8);
-	writel(0, dbi + 0x10 + bar * 4);
-
-	/* BAR4: 1MB, 32-bit memory (required by controller's miop driver) */
+	/* BAR4: 1MB 64-bit prefetchable (required by controller's miop) */
 	bar = 4;
 	writel(0x10, dbi + rebar_off + 0x4 + bar * 8);
 	writel(0xc0, dbi + rebar_off + 0x8 + bar * 8);
-	writel(PCI_BASE_ADDRESS_MEM_TYPE_32, dbi + 0x10 + bar * 4);
+	writel(PCI_BASE_ADDRESS_MEM_PREFETCH | PCI_BASE_ADDRESS_MEM_TYPE_64,
+	       dbi + 0x10 + bar * 4);
 	writel(0, dbi + 0x10 + bar * 4 + 4);
 
-	/* Resize BAR2 through REBAR to minimum, then disable */
-	bar = 2;
-	writel(0x10, dbi + rebar_off + 0x4 + bar * 8);
-	writel(0xc0, dbi + rebar_off + 0x8 + bar * 8);
-	writel(0, dbi + 0x10 + bar * 4);
-	/* BAR3 paired with BAR2 (64-bit), also disabled */
+	/* Disable BAR1,2,3,5 — BAR1 freed when BAR0 went 32-bit;
+	 * BAR2/3 remain at gateware defaults (512MB/512MB) since
+	 * REBAR minimum is 1MB per BAR.  Only disabling standard
+	 * config for now; gateware defaults don't propagate after
+	 * REBAR resize of BAR0/4. */
+	writel(0, dbi + 0x10 + 1 * 4);
+	writel(0, dbi + 0x10 + 2 * 4);
 	writel(0, dbi + 0x10 + 3 * 4);
-
-	/* Disable BAR5 in standard config */
 	writel(0, dbi + 0x10 + 5 * 4);
 }
 
@@ -569,6 +563,16 @@ static void miop_pcie_peer_online(struct miop_pcie *pcie)
 	struct miop_ep *ep = pcie->ep;
 	struct miop_ep_net_driver *net = ep->net_drv;
 	int i;
+
+	dev_info(pcie->dev, "peer_online: 0x8BC=%08x LTSSM=%08x\n",
+		 readl(pcie->dbi_base + 0x8BC),
+		 pcie->apb_base ? readl(pcie->apb_base + 0x300) : 0);
+	/* Re-enable DBI writes (bit 0 of 0x8BC).  Our config_controller
+	 * clears this bit after BAR setup, and the hardware doesn't
+	 * restore it during link training on RK3588.  Without it, the
+	 * controller's miop driver can't write the bar_ctrl magic
+	 * to BAR0+0. */
+	writel(readl(pcie->dbi_base + 0x8BC) | 0x1, pcie->dbi_base + 0x8BC);
 
 	miop_ep_map_outbound_atu(pcie, 0x02CC0000ULL, 0x140000, 0);
 
