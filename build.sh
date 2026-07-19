@@ -15,7 +15,7 @@ cd /root/miop
 tar czf /tmp/miop_src.tar.gz \
   --exclude='*.ko' --exclude='*.o' --exclude='.*' --exclude='*.mod*' \
   --exclude='Module.symvers' --exclude='modules.order' --exclude='*.cmd' \
-  * docs/ include/ 2>&1 | tail -3
+  * 2>&1 | tail -3
 cd /root
 # Push tarball as normal user to /tmp
 sshpass -p "$NPASS" scp -o StrictHostKeyChecking=no \

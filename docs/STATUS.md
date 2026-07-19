@@ -1,9 +1,8 @@
 # Status — C reimplementation
 
-**Date:** 2026-07-14
-**State:** **Fully translated to C and working.** All four modules are clean C.
-The PCIe link trains, the `pci0` interface comes up, and **ping across the
-PCIe fabric works node-to-node in both directions (0% loss)**.
+**Date:** 2026-07-19
+**State:** **Inbound ATU fixed — controller discovers nodes.**  Node-to-node TX
+still broken (doorbells never arrive between nodes).
 
 ## Quick summary
 
@@ -12,12 +11,13 @@ PCIe fabric works node-to-node in both directions (0% loss)**.
 | PCIe link trains to L0          | ✅ LTSSM = 0x230011 |
 | pci0 netdev created             | ✅ `pci0: <BROADCAST,MULTICAST,UP,LOWER_UP>` |
 | IP assignment (10.20.0.x/24)    | ✅ via networkd |
-| on_peer_online → carrier_on     | ✅ |
-| ping node→node over fabric       | ✅ 0% loss (all 3 nodes) |
-| TX data path (dma_submit)       | ✅ implemented |
-| RX data path (IRQ reap)         | ✅ implemented |
-| Peer doorbell / handshake       | ✅ implemented |
-| Build is C-only (no .S)         | ✅ assembly removed |
+| Controller discovers EP         | ✅ reads bar_ctrl, enables "new path" |
+| eDMA self-test                  | ✅ PASS |
+| Inbound ATU (BAR match mode)    | ✅ `CTRL2=0xC0080000`, kernel mirror |
+| REBAR (BAR0 cap=0x5C0 factory)  | ✅ |
+| ELBI regs read by controller    | ✅ 0xE10/E14/E18 |
+| Ping node→node over fabric       | ❌ 100% loss, `RXpoll=0` |
+| Doorbell (peer→peer MemWr)      | ❌ never received |
 
 ## Per-module status
 

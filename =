@@ -1,4 +1,0 @@
-First vmalloc entry: 0xffff8000011a0000
-Last vmalloc entry:  0xffff80000e198000
-=== check some key symbols ===
-=== check phys_to_virt works for 0x03000000 ===
